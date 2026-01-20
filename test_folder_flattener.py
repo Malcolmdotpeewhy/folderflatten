@@ -4,8 +4,6 @@ Test script for Folder Flattener functionality
 Creates a test folder structure and tests the flattening logic
 """
 
-import os
-import shutil
 import tempfile
 from pathlib import Path
 import sys
@@ -76,38 +74,19 @@ def test_flattening_logic():
         print(f"  Total files: {original_file_count}")
         print(f"  Total subfolders: {original_folder_count}")
         
-        # Test the flattening logic
-        from folder_flattener_gui import FolderFlattenerGUI
-        import tkinter as tk
-        
-        # Create a minimal GUI instance for testing
-        root = tk.Tk()
-        root.withdraw()  # Hide the window
-        
-        # Create app instance
-        app = FolderFlattenerGUI(root)
-        app.duplicate_handling.set("rename")
-        app.remove_empty_folders.set(True)
-        
-        # Get files to move
-        files_to_move = app.get_all_files_in_subfolders(test_path)
-        print(f"\nFiles found in subfolders: {len(files_to_move)}")
-        
-        # Simulate the flattening process
-        for source_path, rel_path in files_to_move:
-            target_path = test_path / source_path.name
-            
-            # Handle duplicates
-            if target_path.exists():
-                target_path = app.generate_unique_filename(target_path)
-                print(f"  Duplicate handled: {source_path.name} -> {target_path.name}")
-            
-            # Move file
-            shutil.move(str(source_path), str(target_path))
-            print(f"  Moved: {rel_path} -> {target_path.name}")
-        
-        # Remove empty folders
-        app.remove_empty_folders_recursive(test_path)
+        from folder_flattener_core import flatten_folder
+
+        print("\nRunning core flatten operation...")
+        stats = flatten_folder(
+            test_path,
+            duplicate_mode="rename",
+            remove_empty=True,
+            include_hidden=False,
+            dry_run=False,
+        )
+        print(f"  Files moved: {stats.moved}")
+        print(f"  Files skipped: {stats.skipped}")
+        print(f"  Errors: {stats.errors}")
         
         print("\nAfter flattening:")
         print_folder_structure(test_path)
@@ -154,8 +133,6 @@ def test_flattening_logic():
             print("✅ All expected files found in root directory")
         else:
             print(f"❌ Missing files: {missing_files}")
-        
-        root.destroy()
         
         print("\n" + "=" * 50)
         print("Test completed successfully!")

@@ -21,7 +21,7 @@ import logging
 import os
 import shutil
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import zipfile
@@ -31,6 +31,7 @@ __all__ = [
     "get_logger",
     "human_size",
     "FlattenStats",
+    "MoveRecord",
     "generate_unique_filename",
     "list_files_in_subfolders",
     "remove_empty_folders_recursive",
@@ -110,6 +111,18 @@ class FlattenStats:
     archives_extracted: int = 0
     archive_bytes_written: int = 0
     archives_moved: int = 0
+    overwrites: int = 0
+    undo_supported: bool = False
+    moves: List["MoveRecord"] = field(default_factory=list)
+
+
+@dataclass
+class MoveRecord:
+    """Record of a file move to enable optional undo."""
+
+    source: Path
+    destination: Path
+    category: str
 
 
 # ----------------------------------------------------------------------------
@@ -240,6 +253,7 @@ def flatten_folder(
     extract_archives: bool = False,
     archive_originals: bool = False,
     archive_folder: Optional[Path] = None,
+    record_moves: bool = False,
 ) -> FlattenStats:
     """Flatten a folder by moving all files from subfolders into the root.
 
@@ -251,6 +265,7 @@ def flatten_folder(
         dry_run: If True, do not move files; only simulate.
         progress_cb: Optional callback receiving progress dicts.
         cancel_event: Optional event that, when set, cancels the operation.
+        record_moves: If True, record move operations for optional undo support.
 
     Returns:
         FlattenStats describing the operation outcome.
@@ -278,6 +293,8 @@ def flatten_folder(
     archives_extracted = 0
     archive_bytes_written = 0
     archives_moved = 0
+    overwrites = 0
+    move_records: List[MoveRecord] = []
 
     if extract_archives:
         zips = find_zip_archives(root, include_hidden=include_hidden)
@@ -335,6 +352,7 @@ def flatten_folder(
                                     action = "skip"
                                 elif duplicate_mode == "overwrite":
                                     action = "overwrite"
+                                    overwrites += 1
                                 elif duplicate_mode == "rename":
                                     dest = generate_unique_filename(dest)
                             # Count as extracted
@@ -377,6 +395,7 @@ def flatten_folder(
                                     action = "skip"
                                 elif duplicate_mode == "overwrite":
                                     action = "overwrite"
+                                    overwrites += 1
                                     try:
                                         dest.unlink()
                                     except OSError:
@@ -418,6 +437,14 @@ def flatten_folder(
                             target.parent.mkdir(parents=True, exist_ok=True)
                             shutil.move(str(zip_path), str(target))
                         archives_moved += 1
+                        if record_moves and not dry_run:
+                            move_records.append(
+                                MoveRecord(
+                                    source=zip_path,
+                                    destination=target,
+                                    category="archive",
+                                )
+                            )
                         if progress_cb:
                             progress_cb({
                                 "phase": "archive_move",
@@ -492,6 +519,7 @@ def flatten_folder(
                     skipped += 1
                 elif duplicate_mode == "overwrite":
                     action = "overwrite"
+                    overwrites += 1
                     if not dry_run:
                         # Remove existing before move
                         dest.unlink()
@@ -509,6 +537,14 @@ def flatten_folder(
                     shutil.move(str(src), str(dest))
                     moved += 1
                     bytes_moved += info.size
+                    if record_moves:
+                        move_records.append(
+                            MoveRecord(
+                                source=src,
+                                destination=dest,
+                                category="file",
+                            )
+                        )
 
             if progress_cb:
                 progress_cb(
@@ -557,6 +593,13 @@ def flatten_folder(
         except (OSError, PermissionError) as e:
             logger.error("Error removing empty folders: %s", e)
 
+    undo_supported = (
+        not dry_run
+        and not extract_archives
+        and overwrites == 0
+        and not cancelled
+    )
+
     stats = FlattenStats(
         total_files=total_files,
         total_bytes=total_bytes,
@@ -570,6 +613,9 @@ def flatten_folder(
         archives_extracted=archives_extracted,
         archive_bytes_written=archive_bytes_written,
         archives_moved=archives_moved,
+        overwrites=overwrites,
+        undo_supported=undo_supported,
+        moves=move_records,
     )
 
     if progress_cb:
