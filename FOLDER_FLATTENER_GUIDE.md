@@ -21,6 +21,8 @@ A powerful GUI application that flattens folder structures by moving all files f
 - **Detailed Statistics**: Track files moved, folders removed, duplicates handled
 - **Comprehensive Logging**: Full operation log with timestamps
 - **Preview Mode**: See what changes will be made before executing
+- **Undo Support**: One-click undo for safe operations (when no overwrites/extractions occur)
+- **Archive Extraction**: Optionally extract `.zip` archives found in subfolders
 
 ## Installation
 
@@ -63,6 +65,7 @@ A powerful GUI application that flattens folder structures by moving all files f
    - Click "Flatten Folder" to start the process
    - Monitor progress in real-time
    - Review the completion summary
+   - Use "Undo Last" to revert safe operations if needed
 
 ### Example Scenarios
 
@@ -118,6 +121,16 @@ Photos/
 ### Skip Mode
 - Keeps original files unchanged
 - Skips any files with the same name from subfolders
+
+## Archive Handling Options
+
+### Extract Archives
+- Pulls files out of `.zip` archives found in subfolders
+- Extracted files are flattened into the root directory
+
+### Archive Originals
+- Moves original `.zip` files to an archive folder (defaults to `_archives`)
+- Keeps the root tidy after extraction
 
 ## Safety Features
 
