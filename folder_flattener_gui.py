@@ -41,6 +41,10 @@ from folder_flattener_core import (
     FlattenStats,
     analyze_subfolders,
     check_directory_access,
+from typing import Optional, Dict, Any
+import shutil
+from folder_flattener_core import (
+    FlattenStats,
     flatten_folder,
     generate_unique_filename,
     get_logger,
@@ -1014,6 +1018,7 @@ class FolderFlattenerPro:
                 "💡 Tip: Drag & drop folders directly into the window! | "
                 "Ctrl+O: Browse | Ctrl+Enter: Start | Ctrl+Z: Undo | Esc: Cancel"
             ),
+            text="💡 Tip: Drag & drop folders directly into the window! | Ctrl+O: Browse | Ctrl+Enter: Start | Ctrl+Z: Undo | Esc: Cancel",
             style="GlassMuted.TLabel"
         )
         tips_label.pack(side="right")
@@ -1128,6 +1133,19 @@ class FolderFlattenerPro:
             active.append("max depth")
         if active:
             self.status_label.config(text=f"🧹 Filters active: {', '.join(active)}")
+        if path:
+            self.archive_folder_var.set(path)
+            self._log(f"📦 Archive folder selected: {path}")
+            self._save_current_settings()
+
+    def _on_path_change(self, event=None) -> None:
+        """Handle path changes with debounced preview updates."""
+        if self._preview_timer is not None:
+            try:
+                self.root.after_cancel(self._preview_timer)
+            except Exception:
+                pass
+        self._preview_timer = self.root.after(1000, self._update_preview)
 
     def _on_option_change(self) -> None:
         """Handle option changes and save settings."""
@@ -1234,6 +1252,51 @@ class FolderFlattenerPro:
             "skipped_pattern": summary.skipped_pattern,
             "skipped_size": summary.skipped_size,
             "skipped_dirs": summary.skipped_dirs,
+
+    def _analyze_folder(self, path_obj: Path) -> Dict[str, int]:
+        """Analyze folder contents efficiently for preview stats."""
+        include_hidden = self.include_hidden_var.get()
+        total_files = 0
+        total_bytes = 0
+        subfolders = 0
+        archives_found = 0
+        name_counts: Dict[str, int] = {}
+
+        for dirpath, dirnames, filenames in os.walk(path_obj):
+            current = Path(dirpath)
+            if not include_hidden:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+            if current != path_obj:
+                subfolders += 1
+            else:
+                # Skip files in the root directory (only flatten subfolders)
+                filenames = []
+
+            for filename in filenames:
+                if not include_hidden and filename.startswith("."):
+                    continue
+                file_path = Path(dirpath) / filename
+                try:
+                    size = file_path.stat().st_size
+                except OSError:
+                    size = 0
+                total_files += 1
+                total_bytes += size
+                name_counts[filename] = name_counts.get(filename, 0) + 1
+                if file_path.suffix.lower() == ".zip":
+                    archives_found += 1
+
+        duplicates = sum(
+            count - 1 for count in name_counts.values() if count > 1
+        )
+
+        return {
+            "total_files": total_files,
+            "total_bytes": total_bytes,
+            "subfolders": subfolders,
+            "duplicates": duplicates,
+            "archives_found": archives_found,
         }
 
     def _update_preview(self) -> None:
@@ -1251,6 +1314,13 @@ class FolderFlattenerPro:
 
         if not self._validate_filters():
             self._clear_preview()
+            return
+            return
+        
+        path_obj = Path(path_str)
+        if not path_obj.exists() or not path_obj.is_dir():
+            self._clear_preview()
+            self._log(f"⚠️ Invalid folder path: {path_str}")
             return
         
         try:
@@ -1297,6 +1367,7 @@ class FolderFlattenerPro:
         skipped_size: int = 0,
         skipped_dirs: int = 0,
     ) -> None:
+    def _update_preview_display(self, files: int, bytes_total: int, folders: int, duplicates: int, archives_found: int = 0) -> None:
         """Update the preview display with analysis results."""
         self.total_files = files
         self.total_bytes = bytes_total
@@ -1416,6 +1487,14 @@ class FolderFlattenerPro:
                 "\n".join(access_warnings),
             )
             return
+        # Get settings
+        duplicate_mode = self.duplicate_mode_var.get()
+        remove_empty = self.remove_empty_var.get()
+        include_hidden = self.include_hidden_var.get()
+        dry_run = self.dry_run_var.get()
+        extract_archives = self.extract_archives_var.get()
+        archive_originals = self.archive_originals_var.get()
+        archive_folder = Path(self.archive_folder_var.get()).resolve() if self.archive_folder_var.get().strip() else None
 
         if archive_originals and not extract_archives:
             archive_originals = False
@@ -1724,6 +1803,12 @@ class FolderFlattenerPro:
                 + skipped_size
                 + skipped_dirs
             )
+            moved = getattr(stats, 'moved', 0)
+            skipped = getattr(stats, 'skipped', 0)
+            errors = getattr(stats, 'errors', 0)
+            bytes_moved = getattr(stats, 'bytes_moved', 0)
+            empty_removed = getattr(stats, 'empty_folders_removed', 0)
+            cancelled = getattr(stats, 'cancelled', False)
             
             self._log(f"\n{'='*50}")
             if cancelled:
@@ -1754,6 +1839,10 @@ class FolderFlattenerPro:
                 self._log(f"🗜️ Archives found: {af:,}")
                 self._log(f"📤 Extracted entries: {ae:,} ({human_size(ab)})")
                 self._log(f"📦 Original zips archived: {am:,}")
+            self._log(f"{'='*50}")
+            
+            # Show completion message
+            if not cancelled:
             self._log(f"{'='*50}")
             
             # Show completion message
@@ -1914,6 +2003,20 @@ WHAT IT DOES:
 • Optional .zip archive extraction from subfolders
 • Optional filters to include/exclude extensions, patterns, or sizes
 • Optional directory filters and max-depth constraints
+        self.undo_btn.config(state="disabled")
+
+    def _show_help(self) -> None:
+        """Show help dialog with usage instructions."""
+        help_text = """
+🗂️ Folder Flattener Pro - Help
+
+WHAT IT DOES:
+• Moves all files from subfolders into the main folder
+• Handles duplicate files according to your preference
+• Optionally removes empty folders after moving
+• Provides detailed preview and progress tracking
+• Supports one-click undo for safe operations
+• Optional .zip archive extraction from subfolders
 
 HOW TO USE:
 1. Select a folder using Browse or drag & drop
@@ -1940,6 +2043,8 @@ KEYBOARD SHORTCUTS:
 • F1: Show this help
 • Ctrl+, : Show settings
 • Use “Copy Summary” or “Export Report” for audits
+
+SAFETY FEATURES:
 
 SAFETY FEATURES:
 • Dry run mode for safe preview

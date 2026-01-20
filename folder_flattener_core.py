@@ -43,6 +43,8 @@ __all__ = [
     "FileInfo",
     "find_zip_archives",
 ]
+    "find_zip_archives",
+]
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -749,6 +751,19 @@ def flatten_folder(
                 "skipped_size": scan_summary.skipped_size,
                 "skipped_dirs": scan_summary.skipped_dirs,
                 "duplicates": scan_summary.duplicates,
+                "message": (
+                    f"Found {total_files} files ("
+                    f"{human_size(total_bytes)})"
+                ),
+            }
+        )
+    if progress_cb:
+        progress_cb(
+            {
+                "phase": "scan",
+                "current": 0,
+                "total": total_files,
+                "bytes_total": total_bytes,
                 "message": (
                     f"Found {total_files} files ("
                     f"{human_size(total_bytes)})"

@@ -66,6 +66,7 @@ A powerful GUI application that flattens folder structures by moving all files f
    - Click "Preview Changes" to see what will happen
    - Review the list of files that will be moved
    - Copy or export the preview summary if needed
+   - Review the list of files that will be moved
 
 4. **Execute Flattening**:
    - Click "Flatten Folder" to start the process
