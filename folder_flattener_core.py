@@ -22,20 +22,27 @@ import os
 import shutil
 import threading
 from dataclasses import dataclass, field
+import fnmatch
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 import zipfile
 
 __all__ = [
     "flatten_folder",
+    "analyze_subfolders",
     "get_logger",
     "human_size",
     "FlattenStats",
     "MoveRecord",
+    "ScanSummary",
+    "scan_files_in_subfolders",
+    "check_directory_access",
     "generate_unique_filename",
     "list_files_in_subfolders",
     "remove_empty_folders_recursive",
     "FileInfo",
+    "find_zip_archives",
+]
     "find_zip_archives",
 ]
 
@@ -114,6 +121,42 @@ class FlattenStats:
     overwrites: int = 0
     undo_supported: bool = False
     moves: List["MoveRecord"] = field(default_factory=list)
+    scanned_files: int = 0
+    scanned_bytes: int = 0
+    skipped_hidden: int = 0
+    skipped_symlinks: int = 0
+    skipped_extension: int = 0
+    skipped_pattern: int = 0
+    skipped_size: int = 0
+    duplicate_names: int = 0
+    skipped_dirs: int = 0
+
+
+@dataclass
+class ScanSummary:
+    """Summary of a scan before flattening."""
+
+    total_files: int = 0
+    total_bytes: int = 0
+    subfolders: int = 0
+    duplicates: int = 0
+    archives_found: int = 0
+    skipped_hidden: int = 0
+    skipped_symlinks: int = 0
+    skipped_extension: int = 0
+    skipped_pattern: int = 0
+    skipped_size: int = 0
+    skipped_dirs: int = 0
+
+    def filtered_total(self) -> int:
+        return (
+            self.skipped_hidden
+            + self.skipped_symlinks
+            + self.skipped_extension
+            + self.skipped_pattern
+            + self.skipped_size
+            + self.skipped_dirs
+        )
 
 
 @dataclass
@@ -141,29 +184,210 @@ def is_hidden(path: Path) -> bool:
     return name.startswith(".")
 
 
-def list_files_in_subfolders(
-    root: Path, include_hidden: bool = False
-) -> List[FileInfo]:
-    """List all files under root's subfolders (not those already in root).
+def _normalize_extensions(extensions: Optional[List[str]]) -> Optional[List[str]]:
+    if not extensions:
+        return None
+    normalized = []
+    for ext in extensions:
+        ext = ext.strip()
+        if not ext:
+            continue
+        normalized.append(ext.lower() if ext.startswith(".") else f".{ext.lower()}")
+    return normalized or None
 
-    Args:
-        root: Folder to flatten.
-        include_hidden: Whether to include dotfiles.
 
-    Returns:
-        List of FileInfo for each file to move.
-    """
+def _match_patterns(path: Path, patterns: Optional[List[str]]) -> bool:
+    if not patterns:
+        return False
+    rel = str(path)
+    for pattern in patterns:
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(path.name, pattern):
+            return True
+    return False
+
+
+def _match_dir_patterns(path: Path, patterns: Optional[List[str]]) -> bool:
+    if not patterns:
+        return False
+    rel = str(path)
+    for pattern in patterns:
+        pattern = pattern.strip()
+        if not pattern:
+            continue
+        if fnmatch.fnmatch(rel, pattern) or fnmatch.fnmatch(path.name, pattern):
+            return True
+    return False
+
+
+def check_directory_access(root: Path, *, write_required: bool = True) -> List[str]:
+    """Return a list of access warnings for the target directory."""
+    warnings: List[str] = []
+    if not root.exists() or not root.is_dir():
+        warnings.append("Target folder does not exist or is not a directory.")
+        return warnings
+    if not os.access(root, os.R_OK):
+        warnings.append("Target folder is not readable.")
+    if write_required and not os.access(root, os.W_OK):
+        warnings.append("Target folder is not writable.")
+    return warnings
+
+
+def scan_files_in_subfolders(
+    root: Path,
+    include_hidden: bool = False,
+    *,
+    skip_symlinks: bool = False,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    min_size: int = 0,
+    max_size: Optional[int] = None,
+    collect_files: bool = True,
+    max_depth: Optional[int] = None,
+) -> tuple[List[FileInfo], ScanSummary]:
+    """Scan and return files under root's subfolders with filter summary."""
     files: List[FileInfo] = []
+    summary = ScanSummary()
     root = root.resolve()
-    for p in root.rglob("*"):
-        if p.is_file() and p.parent != root:
-            if not include_hidden and is_hidden(p):
+
+    include_exts = _normalize_extensions(include_extensions)
+    exclude_exts = _normalize_extensions(exclude_extensions)
+    name_counts: Dict[str, int] = {}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        current = Path(dirpath)
+        depth = len(current.relative_to(root).parts)
+
+        if not include_hidden:
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+
+        if exclude_dirs:
+            kept = []
+            for dname in dirnames:
+                candidate = current / dname
+                if _match_dir_patterns(candidate, exclude_dirs):
+                    summary.skipped_dirs += 1
+                    continue
+                kept.append(dname)
+            dirnames[:] = kept
+
+        if max_depth is not None and depth >= max_depth:
+            summary.skipped_dirs += len(dirnames)
+            dirnames[:] = []
+
+        if current != root:
+            summary.subfolders += 1
+        else:
+            filenames = []
+
+        for filename in filenames:
+            if not include_hidden and filename.startswith("."):
+                summary.skipped_hidden += 1
                 continue
+
+            file_path = Path(dirpath) / filename
+            if skip_symlinks and file_path.is_symlink():
+                summary.skipped_symlinks += 1
+                continue
+
+            if _match_patterns(file_path, exclude_patterns):
+                summary.skipped_pattern += 1
+                continue
+
+            suffix = file_path.suffix.lower()
+            if include_exts is not None and suffix not in include_exts:
+                summary.skipped_extension += 1
+                continue
+            if exclude_exts is not None and suffix in exclude_exts:
+                summary.skipped_extension += 1
+                continue
+
             try:
-                size = p.stat().st_size
+                size = file_path.stat().st_size
             except OSError:
                 size = 0
-            files.append(FileInfo(source=p, size=size))
+
+            if min_size and size < min_size:
+                summary.skipped_size += 1
+                continue
+            if max_size is not None and size > max_size:
+                summary.skipped_size += 1
+                continue
+
+            summary.total_files += 1
+            summary.total_bytes += size
+            name_counts[filename] = name_counts.get(filename, 0) + 1
+            if suffix == ".zip":
+                summary.archives_found += 1
+            if collect_files:
+                files.append(FileInfo(source=file_path, size=size))
+
+    summary.duplicates = sum(
+        count - 1 for count in name_counts.values() if count > 1
+    )
+    return files, summary
+
+
+def analyze_subfolders(
+    root: Path,
+    include_hidden: bool = False,
+    *,
+    skip_symlinks: bool = False,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    min_size: int = 0,
+    max_size: Optional[int] = None,
+    max_depth: Optional[int] = None,
+) -> ScanSummary:
+    """Return a scan summary without building the file list."""
+    _, summary = scan_files_in_subfolders(
+        root,
+        include_hidden=include_hidden,
+        skip_symlinks=skip_symlinks,
+        include_extensions=include_extensions,
+        exclude_extensions=exclude_extensions,
+        exclude_patterns=exclude_patterns,
+        exclude_dirs=exclude_dirs,
+        min_size=min_size,
+        max_size=max_size,
+        collect_files=False,
+        max_depth=max_depth,
+    )
+    return summary
+
+
+def list_files_in_subfolders(
+    root: Path,
+    include_hidden: bool = False,
+    *,
+    skip_symlinks: bool = False,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    min_size: int = 0,
+    max_size: Optional[int] = None,
+    max_depth: Optional[int] = None,
+) -> List[FileInfo]:
+    """List all files under root's subfolders (not those already in root)."""
+    files, _ = scan_files_in_subfolders(
+        root,
+        include_hidden=include_hidden,
+        skip_symlinks=skip_symlinks,
+        include_extensions=include_extensions,
+        exclude_extensions=exclude_extensions,
+        exclude_patterns=exclude_patterns,
+        exclude_dirs=exclude_dirs,
+        min_size=min_size,
+        max_size=max_size,
+        max_depth=max_depth,
+    )
     return files
 
 
@@ -254,6 +478,14 @@ def flatten_folder(
     archive_originals: bool = False,
     archive_folder: Optional[Path] = None,
     record_moves: bool = False,
+    skip_symlinks: bool = False,
+    include_extensions: Optional[List[str]] = None,
+    exclude_extensions: Optional[List[str]] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    exclude_dirs: Optional[List[str]] = None,
+    min_size: int = 0,
+    max_size: Optional[int] = None,
+    max_depth: Optional[int] = None,
 ) -> FlattenStats:
     """Flatten a folder by moving all files from subfolders into the root.
 
@@ -266,6 +498,14 @@ def flatten_folder(
         progress_cb: Optional callback receiving progress dicts.
         cancel_event: Optional event that, when set, cancels the operation.
         record_moves: If True, record move operations for optional undo support.
+        skip_symlinks: If True, skip symbolic links.
+        include_extensions: Optional list of extensions to include.
+        exclude_extensions: Optional list of extensions to exclude.
+        exclude_patterns: Optional list of glob patterns to skip.
+        exclude_dirs: Optional list of glob patterns to skip directories.
+        min_size: Skip files smaller than this size in bytes.
+        max_size: Skip files larger than this size in bytes.
+        max_depth: Maximum subfolder depth to include.
 
     Returns:
         FlattenStats describing the operation outcome.
@@ -474,7 +714,18 @@ def flatten_folder(
                 continue
 
     # Now list files to move from subfolders (optionally exclude .zip files)
-    files = list_files_in_subfolders(root, include_hidden=include_hidden)
+    files, scan_summary = scan_files_in_subfolders(
+        root,
+        include_hidden=include_hidden,
+        skip_symlinks=skip_symlinks,
+        include_extensions=include_extensions,
+        exclude_extensions=exclude_extensions,
+        exclude_patterns=exclude_patterns,
+        exclude_dirs=exclude_dirs,
+        min_size=min_size,
+        max_size=max_size,
+        max_depth=max_depth,
+    )
     if extract_archives:
         files = [f for f in files if f.source.suffix.lower() != ".zip"]
 
@@ -486,6 +737,26 @@ def flatten_folder(
     errors = 0
     bytes_moved = 0
 
+    if progress_cb:
+        progress_cb(
+            {
+                "phase": "scan",
+                "current": 0,
+                "total": total_files,
+                "bytes_total": total_bytes,
+                "skipped_hidden": scan_summary.skipped_hidden,
+                "skipped_symlinks": scan_summary.skipped_symlinks,
+                "skipped_extension": scan_summary.skipped_extension,
+                "skipped_pattern": scan_summary.skipped_pattern,
+                "skipped_size": scan_summary.skipped_size,
+                "skipped_dirs": scan_summary.skipped_dirs,
+                "duplicates": scan_summary.duplicates,
+                "message": (
+                    f"Found {total_files} files ("
+                    f"{human_size(total_bytes)})"
+                ),
+            }
+        )
     if progress_cb:
         progress_cb(
             {
@@ -616,6 +887,15 @@ def flatten_folder(
         overwrites=overwrites,
         undo_supported=undo_supported,
         moves=move_records,
+        scanned_files=scan_summary.total_files,
+        scanned_bytes=scan_summary.total_bytes,
+        skipped_hidden=scan_summary.skipped_hidden,
+        skipped_symlinks=scan_summary.skipped_symlinks,
+        skipped_extension=scan_summary.skipped_extension,
+        skipped_pattern=scan_summary.skipped_pattern,
+        skipped_size=scan_summary.skipped_size,
+        skipped_dirs=scan_summary.skipped_dirs,
+        duplicate_names=scan_summary.duplicates,
     )
 
     if progress_cb:

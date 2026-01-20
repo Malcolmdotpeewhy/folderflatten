@@ -23,6 +23,9 @@ A powerful GUI application that flattens folder structures by moving all files f
 - **Preview Mode**: See what changes will be made before executing
 - **Undo Support**: One-click undo for safe operations (when no overwrites/extractions occur)
 - **Archive Extraction**: Optionally extract `.zip` archives found in subfolders
+- **Filters & Safety**: Skip symlinks, filter by extensions/patterns, and set size limits
+- **Directory Controls**: Exclude directories or limit subfolder depth
+- **Exportable Reports**: Copy summaries or save JSON reports
 
 ## Installation
 
@@ -56,9 +59,13 @@ A powerful GUI application that flattens folder structures by moving all files f
 2. **Configure Options**:
    - Choose duplicate handling method (Rename/Overwrite/Skip)
    - Enable/disable empty folder removal
+   - Optionally set filters (extensions, patterns, size limits, skip symlinks)
+   - Exclude directories or set a maximum depth for scanning
 
 3. **Preview Changes** (recommended):
    - Click "Preview Changes" to see what will happen
+   - Review the list of files that will be moved
+   - Copy or export the preview summary if needed
    - Review the list of files that will be moved
 
 4. **Execute Flattening**:
@@ -131,6 +138,29 @@ Photos/
 ### Archive Originals
 - Moves original `.zip` files to an archive folder (defaults to `_archives`)
 - Keeps the root tidy after extraction
+
+## Filters & Safety Options
+
+### Skip Symlinks
+- Ignores symbolic links to avoid moving linked targets by accident
+
+### Extension Filters
+- **Include**: Only move files with listed extensions
+- **Exclude**: Skip files with listed extensions
+
+### Pattern Filters
+- Skip files matching glob patterns (e.g., `*.tmp`, `cache/*`)
+
+### Directory Filters
+- Skip folders matching glob patterns (e.g., `node_modules`, `**/cache`)
+- Limit scanning to a maximum depth for large trees
+
+### Size Limits
+- Set minimum or maximum file sizes to include
+
+### Reports
+- Use “Copy Summary” to place key stats on the clipboard
+- Use “Export Report” to save a JSON summary
 
 ## Safety Features
 
