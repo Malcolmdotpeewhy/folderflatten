@@ -4,8 +4,6 @@ Simple test for Folder Flattener core functionality
 Tests only the file operations without GUI components
 """
 
-import os
-import shutil
 import tempfile
 from pathlib import Path
 
@@ -42,59 +40,6 @@ def create_test_structure(base_path: Path) -> None:
     
     # Create a duplicate file in root for testing
     (base_path / "duplicate.txt").write_text("Original duplicate file in root")
-
-def get_all_files_in_subfolders(root_path: Path):
-    """Get all files in subfolders with their relative paths"""
-    files_to_move = []
-    
-    for item in root_path.rglob("*"):
-        if item.is_file() and item.parent != root_path:
-            # Calculate relative path from original subfolder structure
-            rel_path = item.relative_to(root_path)
-            files_to_move.append((item, rel_path))
-    
-    return files_to_move
-
-def generate_unique_filename(target_path: Path) -> Path:
-    """Generate a unique filename if file already exists"""
-    if not target_path.exists():
-        return target_path
-    
-    stem = target_path.stem
-    suffix = target_path.suffix
-    parent = target_path.parent
-    counter = 1
-    
-    while True:
-        new_name = f"{stem}_{counter}{suffix}"
-        new_path = parent / new_name
-        if not new_path.exists():
-            return new_path
-        counter += 1
-
-def remove_empty_folders_recursive(root_path: Path) -> int:
-    """Remove empty folders recursively, return count of removed folders"""
-    folders_removed = 0
-    folders_to_check = []
-    
-    # Collect all folders (deepest first)
-    for item in root_path.rglob("*"):
-        if item.is_dir() and item != root_path:
-            folders_to_check.append(item)
-    
-    # Sort by depth (deepest first)
-    folders_to_check.sort(key=lambda x: len(x.parts), reverse=True)
-    
-    for folder in folders_to_check:
-        try:
-            if folder.exists() and not any(folder.iterdir()):
-                folder.rmdir()
-                folders_removed += 1
-                print(f"  Removed empty folder: {folder.relative_to(root_path)}")
-        except Exception as e:
-            print(f"  Could not remove folder {folder}: {str(e)}")
-    
-    return folders_removed
 
 def print_folder_structure(path: Path, indent: str = "") -> None:
     """Print the folder structure for visualization"""
@@ -135,41 +80,16 @@ def test_flattening_logic():
         print(f"  Total files: {original_file_count}")
         print(f"  Total subfolders: {original_folder_count}")
         
-        # Get files to move
-        files_to_move = get_all_files_in_subfolders(test_path)
-        print(f"\nFiles found in subfolders: {len(files_to_move)}")
-        
-        # Statistics
-        stats = {
-            'files_moved': 0,
-            'duplicates_handled': 0,
-            'errors': 0
-        }
-        
-        # Simulate the flattening process
+        from folder_flattener_core import flatten_folder
+
         print("\nFlattening process:")
-        for source_path, rel_path in files_to_move:
-            try:
-                target_path = test_path / source_path.name
-                
-                # Handle duplicates
-                if target_path.exists():
-                    target_path = generate_unique_filename(target_path)
-                    stats['duplicates_handled'] += 1
-                    print(f"  Duplicate renamed: {source_path.name} -> {target_path.name}")
-                
-                # Move file
-                shutil.move(str(source_path), str(target_path))
-                stats['files_moved'] += 1
-                print(f"  Moved: {rel_path} -> {target_path.name}")
-                
-            except Exception as e:
-                stats['errors'] += 1
-                print(f"  Error moving {source_path}: {str(e)}")
-        
-        # Remove empty folders
-        print("\nRemoving empty folders:")
-        folders_removed = remove_empty_folders_recursive(test_path)
+        stats = flatten_folder(
+            test_path,
+            duplicate_mode="rename",
+            remove_empty=True,
+            include_hidden=False,
+            dry_run=False,
+        )
         
         print("\nAfter flattening:")
         print_folder_structure(test_path)
@@ -180,10 +100,10 @@ def test_flattening_logic():
         final_folder_count = len([f for f in final_files if f.is_dir()]) - 1  # Exclude root
         
         print(f"\nResults:")
-        print(f"  Files moved: {stats['files_moved']}")
-        print(f"  Duplicates handled: {stats['duplicates_handled']}")
-        print(f"  Folders removed: {folders_removed}")
-        print(f"  Errors: {stats['errors']}")
+        print(f"  Files moved: {stats.moved}")
+        print(f"  Files skipped: {stats.skipped}")
+        print(f"  Folders removed: {stats.empty_folders_removed}")
+        print(f"  Errors: {stats.errors}")
         print(f"  Final file count: {final_file_count}")
         print(f"  Final folder count: {final_folder_count}")
         
@@ -222,7 +142,7 @@ def test_flattening_logic():
         else:
             print(f"❌ Missing files: {missing_files}")
         
-        if stats['errors'] == 0 and not missing_files and final_folder_count == 0:
+        if stats.errors == 0 and not missing_files and final_folder_count == 0:
             print("\n🎉 All tests passed! Folder flattener is working correctly.")
         else:
             print("\n⚠️ Some tests failed. Check the results above.")

@@ -35,429 +35,17 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Callable
-import webbrowser
-import logging
+from typing import Optional, Dict, Any, List
 import shutil
-from dataclasses import dataclass
-import zipfile
-
-# Embedded Core Logic (replaces external folder_flattener_core dependency)
-# ----------------------------------------------------------------------
-
-__all__ = []
-
-
-def get_logger(log_path: Optional[Path] = None) -> logging.Logger:
-    logger = getattr(get_logger, "_logger", None)
-    if logger is not None:
-        return logger
-    logger = logging.getLogger("folder_flattener")
-    logger.setLevel(logging.INFO)
-    if not logger.handlers:
-        try:
-            if log_path is None:
-                log_path = Path(__file__).with_name("folder_flattener.log")
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(log_path, encoding="utf-8")
-            fmt = logging.Formatter(
-                "%(asctime)s - %(levelname)s - %(message)s",
-                datefmt="%Y-%m-%d %H:%M:%S",
-            )
-            fh.setFormatter(fmt)
-            logger.addHandler(fh)
-        except (OSError, PermissionError):
-            ch = logging.StreamHandler()
-            logger.addHandler(ch)
-    setattr(get_logger, "_logger", logger)
-    return logger
-
-
-@dataclass
-class FileInfo:
-    source: Path
-    size: int
-
-
-@dataclass
-class FlattenStats:
-    total_files: int
-    total_bytes: int
-    moved: int
-    skipped: int
-    errors: int
-    bytes_moved: int
-    empty_folders_removed: int
-    cancelled: bool = False
-    archives_found: int = 0
-    archives_extracted: int = 0
-    archive_bytes_written: int = 0
-    archives_moved: int = 0
-
-
-def is_hidden(path: Path) -> bool:
-    name = path.name
-    return name.startswith(".")
-
-
-def list_files_in_subfolders(root: Path, include_hidden: bool = False) -> List[FileInfo]:
-    files: List[FileInfo] = []
-    root = root.resolve()
-    for p in root.rglob("*"):
-        if p.is_file() and p.parent != root:
-            if not include_hidden and is_hidden(p):
-                continue
-            try:
-                size = p.stat().st_size
-            except OSError:
-                size = 0
-            files.append(FileInfo(source=p, size=size))
-    return files
-
-
-def find_zip_archives(root: Path, include_hidden: bool = False) -> List[Path]:
-    """Case-insensitive zip discovery in root and subfolders."""
-    zips: List[Path] = []
-    root = root.resolve()
-    for p in root.rglob("*"):
-        if p.is_file():  # include files both in root and subfolders
-            if not include_hidden and is_hidden(p):
-                continue
-            if p.suffix.lower() == ".zip":
-                zips.append(p)
-    return zips
-
-
-def human_size(num_bytes: int) -> str:
-    units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(num_bytes)
-    for unit in units:
-        if size < 1024 or unit == units[-1]:
-            return f"{size:.2f} {unit}"
-        size /= 1024
-    return f"{size:.2f} TB"
-
-
-def generate_unique_filename(target_path: Path) -> Path:
-    parent = target_path.parent
-    stem = target_path.stem
-    suffix = target_path.suffix
-    i = 1
-    candidate = target_path
-    while candidate.exists():
-        candidate = parent / f"{stem}_{i}{suffix}"
-        i += 1
-    return candidate
-
-
-def remove_empty_folders_recursive(root: Path) -> int:
-    count = 0
-    for dirpath, _, _ in os.walk(root, topdown=False):
-        p = Path(dirpath)
-        if p == root:
-            continue
-        try:
-            if not any(Path(dirpath).iterdir()):
-                p.rmdir()
-                count += 1
-        except (OSError, PermissionError):
-            continue
-    return count
-
-
-ProgressCallback = Callable[[Dict[str, object]], None]
-
-
-def flatten_folder(
-    root: Path,
-    duplicate_mode: str = "rename",
-    remove_empty: bool = True,
-    include_hidden: bool = False,
-    dry_run: bool = False,
-    progress_cb: Optional[ProgressCallback] = None,
-    cancel_event: Optional[threading.Event] = None,
-    *,
-    extract_archives: bool = False,
-    archive_originals: bool = False,
-    archive_folder: Optional[Path] = None,
-) -> FlattenStats:
-    logger = get_logger()
-    root = root.resolve()
-    if not root.exists() or not root.is_dir():
-        raise NotADirectoryError(f"Invalid directory: {root}")
-
-    duplicate_mode = duplicate_mode.lower()
-    if duplicate_mode not in {"rename", "overwrite", "skip"}:
-        raise ValueError("duplicate_mode must be 'rename', 'overwrite', or 'skip'")
-
-    archives_found = 0
-    archives_extracted = 0
-    archive_bytes_written = 0
-    archives_moved = 0
-
-    if extract_archives:
-        zips = find_zip_archives(root, include_hidden=include_hidden)
-        archives_found = len(zips)
-        if progress_cb:
-            progress_cb({
-                "phase": "extract_scan",
-                "total": archives_found,
-                "message": f"Found {archives_found} zip archive(s) to extract",
-            })
-
-        if archive_originals:
-            if archive_folder is None:
-                archive_folder = root / "_archives"
-            archive_folder = archive_folder.resolve()
-            if not dry_run:
-                try:
-                    archive_folder.mkdir(parents=True, exist_ok=True)
-                except (OSError, PermissionError) as e:
-                    logger.error(
-                        "Cannot create archive folder %s: %s", archive_folder, e
-                    )
-                    archive_originals = False
-
-        for idx_zip, zip_path in enumerate(zips, start=1):
-            if cancel_event is not None and cancel_event.is_set():
-                break
-            try:
-                if progress_cb:
-                    progress_cb({
-                        "phase": "extract",
-                        "zip": str(zip_path),
-                        "zip_index": idx_zip,
-                        "zip_total": archives_found,
-                        "message": f"Extracting {zip_path.name}",
-                    })
-                if dry_run:
-                    with zipfile.ZipFile(zip_path) as zf:
-                        for zinfo in zf.infolist():
-                            if zinfo.is_dir():
-                                continue
-                            dest = root / Path(zinfo.filename).name
-                            action = "move"
-                            if dest.exists():
-                                if duplicate_mode == "skip":
-                                    action = "skip"
-                                elif duplicate_mode == "overwrite":
-                                    action = "overwrite"
-                                elif duplicate_mode == "rename":
-                                    dest = generate_unique_filename(dest)
-                            archives_extracted += 1
-                            archive_bytes_written += zinfo.file_size
-                            if progress_cb:
-                                progress_cb({
-                                    "phase": "extract_file",
-                                    "zip": str(zip_path),
-                                    "file": Path(zinfo.filename).name,
-                                    "action": action,
-                                })
-                else:
-                    with zipfile.ZipFile(zip_path) as zf:
-                        for zinfo in zf.infolist():
-                            if zinfo.is_dir():
-                                continue
-                            if zinfo.flag_bits & 0x1:
-                                msg = f"Encrypted entry skipped: {zinfo.filename}"
-                                logger.warning(msg)
-                                if progress_cb:
-                                    progress_cb({
-                                        "phase": "error",
-                                        "file": f"{zip_path.name}:{zinfo.filename}",
-                                        "error": msg,
-                                    })
-                                continue
-                            dest = root / Path(zinfo.filename).name
-                            action = "move"
-                            if dest.exists():
-                                if duplicate_mode == "skip":
-                                    action = "skip"
-                                elif duplicate_mode == "overwrite":
-                                    action = "overwrite"
-                                    try:
-                                        dest.unlink()
-                                    except OSError:
-                                        pass
-                                elif duplicate_mode == "rename":
-                                    dest = generate_unique_filename(dest)
-                            if action != "skip":
-                                dest.parent.mkdir(parents=True, exist_ok=True)
-                                with zf.open(zinfo, "r") as src_f, open(dest, "wb") as out_f:
-                                    shutil.copyfileobj(src_f, out_f)
-                                archives_extracted += 1
-                                archive_bytes_written += zinfo.file_size
-                            else:
-                                archives_extracted += 1
-                            if progress_cb:
-                                progress_cb({
-                                    "phase": "extract_file",
-                                    "zip": str(zip_path),
-                                    "file": Path(zinfo.filename).name,
-                                    "dest": str(dest),
-                                    "action": action,
-                                })
-                if archive_originals:
-                    try:
-                        target = (archive_folder / zip_path.name) if archive_folder else (root / "_archives" / zip_path.name)
-                        if target.exists():
-                            target = generate_unique_filename(target)
-                        if not dry_run:
-                            target.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(zip_path), str(target))
-                        archives_moved += 1
-                        if progress_cb:
-                            progress_cb({
-                                "phase": "archive_move",
-                                "source": str(zip_path),
-                                "dest": str(target),
-                            })
-                    except (OSError, shutil.Error) as e:
-                        logger.error("Error moving archive %s: %s", zip_path, e)
-                        if progress_cb:
-                            progress_cb({
-                                "phase": "error",
-                                "file": str(zip_path),
-                                "error": str(e),
-                            })
-            except zipfile.BadZipFile as e:
-                logger.error("Bad zip file %s: %s", zip_path, e)
-                if progress_cb:
-                    progress_cb({
-                        "phase": "error",
-                        "file": str(zip_path),
-                        "error": f"Bad zip file: {e}",
-                    })
-                continue
-
-    files = list_files_in_subfolders(root, include_hidden=include_hidden)
-    if extract_archives:
-        files = [f for f in files if f.source.suffix.lower() != ".zip"]
-
-    total_files = len(files)
-    total_bytes = sum(f.size for f in files)
-
-    moved = 0
-    skipped = 0
-    errors = 0
-    bytes_moved = 0
-
-    if progress_cb:
-        progress_cb({
-            "phase": "scan",
-            "current": 0,
-            "total": total_files,
-            "bytes_total": total_bytes,
-            "message": f"Found {total_files} files ({human_size(total_bytes)})",
-        })
-
-    cancelled = False
-
-    for idx, info in enumerate(files, start=1):
-        if cancel_event is not None and cancel_event.is_set():
-            cancelled = True
-            break
-        src = info.source
-        dest = root / src.name
-        action = "move"
-        reason = ""
-        try:
-            if dest.exists():
-                if duplicate_mode == "skip":
-                    action = "skip"
-                    skipped += 1
-                elif duplicate_mode == "overwrite":
-                    action = "overwrite"
-                    if not dry_run:
-                        dest.unlink()
-                elif duplicate_mode == "rename":
-                    dest = generate_unique_filename(dest)
-            if action == "skip":
-                reason = "duplicate"
-            else:
-                if dry_run:
-                    moved += 1
-                    bytes_moved += info.size
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(src), str(dest))
-                    moved += 1
-                    bytes_moved += info.size
-            if progress_cb:
-                progress_cb({
-                    "phase": "move",
-                    "current": idx,
-                    "total": total_files,
-                    "file": str(src),
-                    "dest": str(dest),
-                    "action": action,
-                    "reason": reason,
-                    "moved": moved,
-                    "skipped": skipped,
-                    "errors": errors,
-                    "bytes_moved": bytes_moved,
-                    "bytes_total": total_bytes,
-                })
-        except (OSError, shutil.Error) as e:
-            errors += 1
-            logger.error("Error moving %s: %s", src, e)
-            if progress_cb:
-                progress_cb({
-                    "phase": "error",
-                    "current": idx,
-                    "total": total_files,
-                    "file": str(src),
-                    "error": str(e),
-                    "moved": moved,
-                    "skipped": skipped,
-                    "errors": errors,
-                    "bytes_moved": bytes_moved,
-                    "bytes_total": total_bytes,
-                })
-            continue
-
-    empty_removed = 0
-    if remove_empty and not cancelled:
-        try:
-            if not dry_run:
-                empty_removed = remove_empty_folders_recursive(root)
-            else:
-                empty_removed = 0
-        except (OSError, PermissionError) as e:
-            logger.error("Error removing empty folders: %s", e)
-
-    stats = FlattenStats(
-        total_files=total_files,
-        total_bytes=total_bytes,
-        moved=moved,
-        skipped=skipped,
-        errors=errors,
-        bytes_moved=bytes_moved,
-        empty_folders_removed=empty_removed,
-        cancelled=cancelled,
-        archives_found=archives_found,
-        archives_extracted=archives_extracted,
-        archive_bytes_written=archive_bytes_written,
-        archives_moved=archives_moved,
-    )
-
-    if progress_cb:
-        progress_cb({
-            "phase": "done",
-            "stats": stats,
-            "message": (
-                "Completed: moved=%d, skipped=%d, errors=%d, removed_empty=%d%s"
-                % (
-                    moved,
-                    skipped,
-                    errors,
-                    empty_removed,
-                    ", cancelled" if cancelled else "",
-                )
-            ),
-        })
-
-    return stats
+from folder_flattener_core import (
+    FlattenStats,
+    analyze_subfolders,
+    check_directory_access,
+    flatten_folder,
+    generate_unique_filename,
+    get_logger,
+    human_size,
+)
 
 # Optional drag and drop
 try:
@@ -702,6 +290,17 @@ class SettingsManager:
             'include_hidden': False,
             'dry_run': False,
             'duplicate_mode': 'rename',
+            'extract_archives': True,
+            'archive_originals': False,
+            'archive_folder': '',
+            'skip_symlinks': True,
+            'include_extensions': '',
+            'exclude_extensions': '',
+            'exclude_patterns': '',
+            'exclude_dirs': '',
+            'min_size_kb': '',
+            'max_size_mb': '',
+            'max_depth': '',
             'window_geometry': '1200x800+100+100',
             'theme': 'dark'
         }
@@ -867,6 +466,14 @@ class FolderFlattenerPro:
         self.extract_archives_var = tk.BooleanVar(value=self.settings.get('extract_archives', True))
         self.archive_originals_var = tk.BooleanVar(value=self.settings.get('archive_originals', False))
         self.archive_folder_var = tk.StringVar(value=self.settings.get('archive_folder', ''))
+        self.skip_symlinks_var = tk.BooleanVar(value=self.settings.get('skip_symlinks', True))
+        self.include_extensions_var = tk.StringVar(value=self.settings.get('include_extensions', ''))
+        self.exclude_extensions_var = tk.StringVar(value=self.settings.get('exclude_extensions', ''))
+        self.exclude_patterns_var = tk.StringVar(value=self.settings.get('exclude_patterns', ''))
+        self.exclude_dirs_var = tk.StringVar(value=self.settings.get('exclude_dirs', ''))
+        self.min_size_kb_var = tk.StringVar(value=self.settings.get('min_size_kb', ''))
+        self.max_size_mb_var = tk.StringVar(value=self.settings.get('max_size_mb', ''))
+        self.max_depth_var = tk.StringVar(value=self.settings.get('max_depth', ''))
 
         # Internal state
         self._preview_timer = None
@@ -874,6 +481,7 @@ class FolderFlattenerPro:
         self.total_bytes = 0
         self.preview_data = None
         self.last_operation = None
+        self.last_stats: Optional[FlattenStats] = None
         
         # Threading
         self.events: "queue.Queue[dict]" = queue.Queue()
@@ -1051,6 +659,14 @@ class FolderFlattenerPro:
             command=self._on_option_change
         ).pack(side="left", anchor="w", pady=5)
 
+        ttk.Checkbutton(
+            options_frame,
+            text="🔗 Skip symbolic links",
+            variable=self.skip_symlinks_var,
+            style="Modern.TCheckbutton",
+            command=self._on_option_change
+        ).pack(anchor="w", pady=5)
+
         # Archive folder selector
         af_frame = ttk.Frame(options_frame, style="Card.TFrame")
         af_frame.pack(fill="x", pady=(5, 10))
@@ -1073,6 +689,62 @@ class FolderFlattenerPro:
             command=self._browse_archive_folder,
             style="Primary.TButton"
         ).pack(side="left", padx=(8, 0))
+
+        ttk.Separator(card_content, style="Modern.TSeparator").pack(fill="x", pady=20)
+
+        ttk.Label(
+            card_content,
+            text="🧹 Filters",
+            style="Info.TLabel"
+        ).pack(anchor="w", pady=(0, 15))
+
+        filters_frame = ttk.Frame(card_content, style="Card.TFrame")
+        filters_frame.pack(fill="x", pady=(0, 20))
+
+        ttk.Label(filters_frame, text="Include extensions (e.g. jpg,png):", style="Muted.TLabel").pack(anchor="w")
+        include_entry = ttk.Entry(filters_frame, textvariable=self.include_extensions_var, style="Modern.TEntry")
+        include_entry.pack(fill="x", pady=(0, 8))
+        include_entry.bind("<KeyRelease>", self._on_option_change)
+
+        ttk.Label(filters_frame, text="Exclude extensions (e.g. tmp,log):", style="Muted.TLabel").pack(anchor="w")
+        exclude_entry = ttk.Entry(filters_frame, textvariable=self.exclude_extensions_var, style="Modern.TEntry")
+        exclude_entry.pack(fill="x", pady=(0, 8))
+        exclude_entry.bind("<KeyRelease>", self._on_option_change)
+
+        ttk.Label(filters_frame, text="Exclude patterns (glob):", style="Muted.TLabel").pack(anchor="w")
+        pattern_entry = ttk.Entry(filters_frame, textvariable=self.exclude_patterns_var, style="Modern.TEntry")
+        pattern_entry.pack(fill="x", pady=(0, 8))
+        pattern_entry.bind("<KeyRelease>", self._on_option_change)
+
+        ttk.Label(filters_frame, text="Exclude directories (glob):", style="Muted.TLabel").pack(anchor="w")
+        dir_entry = ttk.Entry(filters_frame, textvariable=self.exclude_dirs_var, style="Modern.TEntry")
+        dir_entry.pack(fill="x", pady=(0, 8))
+        dir_entry.bind("<KeyRelease>", self._on_option_change)
+
+        size_row = ttk.Frame(filters_frame, style="Card.TFrame")
+        size_row.pack(fill="x")
+        ttk.Label(size_row, text="Min size (KB):", style="Muted.TLabel").pack(side="left")
+        min_entry = ttk.Entry(size_row, textvariable=self.min_size_kb_var, style="Modern.TEntry", width=10)
+        min_entry.pack(side="left", padx=(6, 16))
+        min_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(size_row, text="Max size (MB):", style="Muted.TLabel").pack(side="left")
+        max_entry = ttk.Entry(size_row, textvariable=self.max_size_mb_var, style="Modern.TEntry", width=10)
+        max_entry.pack(side="left", padx=(6, 0))
+        max_entry.bind("<KeyRelease>", self._on_option_change)
+
+        depth_row = ttk.Frame(filters_frame, style="Card.TFrame")
+        depth_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(depth_row, text="Max depth:", style="Muted.TLabel").pack(side="left")
+        depth_entry = ttk.Entry(depth_row, textvariable=self.max_depth_var, style="Modern.TEntry", width=10)
+        depth_entry.pack(side="left", padx=(6, 0))
+        depth_entry.bind("<KeyRelease>", self._on_option_change)
+
+        ttk.Button(
+            filters_frame,
+            text="🧼 Clear Filters",
+            style="Primary.TButton",
+            command=self._clear_filters,
+        ).pack(anchor="w", pady=(8, 0))
 
         # Separator
         ttk.Separator(card_content, style="Modern.TSeparator").pack(fill="x", pady=20)
@@ -1154,6 +826,27 @@ class FolderFlattenerPro:
             style="Info.TLabel"
         )
         preview_label.pack(anchor="w", pady=(0, 15))
+
+        preview_actions = ttk.Frame(card_content, style="Card.TFrame")
+        preview_actions.pack(fill="x", pady=(0, 10))
+        ttk.Button(
+            preview_actions,
+            text="🔄 Refresh Preview",
+            style="Primary.TButton",
+            command=self._update_preview,
+        ).pack(side="left")
+        ttk.Button(
+            preview_actions,
+            text="📋 Copy Summary",
+            style="Primary.TButton",
+            command=self._copy_summary,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            preview_actions,
+            text="💾 Export Report",
+            style="Primary.TButton",
+            command=self._export_report,
+        ).pack(side="left", padx=(8, 0))
         
         # Stats frame
         self.stats_frame = ttk.Frame(card_content, style="Glass.TFrame")
@@ -1273,6 +966,18 @@ class FolderFlattenerPro:
             style="GlassInfo.TLabel"
         )
         self.extracted_label.grid(row=2, column=1, sticky="w", padx=(0, 20), pady=5)
+        self.filtered_label = ttk.Label(
+            stats_grid,
+            text="🧹 Filtered out: --",
+            style="GlassInfo.TLabel"
+        )
+        self.filtered_label.grid(row=3, column=0, sticky="w", padx=(0, 20), pady=5)
+        self.filtered_breakdown_label = ttk.Label(
+            stats_grid,
+            text="Hidden -- • Links -- • Ext -- • Patterns -- • Size -- • Dirs --",
+            style="GlassInfo.TLabel"
+        )
+        self.filtered_breakdown_label.grid(row=3, column=1, sticky="w", padx=(0, 20), pady=5)
 
     def _build_status_bar(self, parent) -> None:
         """Build the status bar at the bottom."""
@@ -1283,17 +988,32 @@ class FolderFlattenerPro:
         status_content.pack(fill="x", padx=15, pady=8)
         
         # Status text
+        status_left = ttk.Frame(status_content, style="Glass.TFrame")
+        status_left.pack(side="left")
+
         self.status_label = ttk.Label(
-            status_content,
+            status_left,
             text="🟢 Ready",
             style="GlassMuted.TLabel"
         )
         self.status_label.pack(side="left")
+
+        self.undo_btn = ttk.Button(
+            status_left,
+            text="↩️ Undo Last",
+            command=self._undo_last_operation,
+            style="Primary.TButton",
+            state="disabled",
+        )
+        self.undo_btn.pack(side="left", padx=(12, 0))
         
         # Quick tips
         tips_label = ttk.Label(
             status_content,
-            text="💡 Tip: Drag & drop folders directly into the window! | Ctrl+O: Browse | Ctrl+Enter: Start | Esc: Cancel",
+            text=(
+                "💡 Tip: Drag & drop folders directly into the window! | "
+                "Ctrl+O: Browse | Ctrl+Enter: Start | Ctrl+Z: Undo | Esc: Cancel"
+            ),
             style="GlassMuted.TLabel"
         )
         tips_label.pack(side="right")
@@ -1318,6 +1038,7 @@ class FolderFlattenerPro:
         self.root.bind('<Control-Return>', lambda e: self._start_operation())
         self.root.bind('<Control-Enter>', lambda e: self._start_operation())
         self.root.bind('<Escape>', lambda e: self._cancel_operation())
+        self.root.bind('<Control-z>', lambda e: self._undo_last_operation())
         self.root.bind('<F1>', lambda e: self._show_help())
         self.root.bind('<Control-comma>', lambda e: self._show_settings())
 
@@ -1376,6 +1097,8 @@ class FolderFlattenerPro:
             self.archive_folder_var.set(path)
             self._log(f"📦 Archive folder selected: {path}")
             self._save_current_settings()
+            if self.path_var.get():
+                self._update_preview()
 
     def _on_path_change(self, event=None) -> None:
         """Handle path changes with debounced preview updates."""
@@ -1386,11 +1109,132 @@ class FolderFlattenerPro:
                 pass
         self._preview_timer = self.root.after(1000, self._update_preview)
 
+    def _status_for_filters(self) -> None:
+        filters = self._get_filter_settings()
+        active = []
+        if filters["include_extensions"]:
+            active.append("include extensions")
+        if filters["exclude_extensions"]:
+            active.append("exclude extensions")
+        if filters["exclude_patterns"]:
+            active.append("exclude patterns")
+        if filters["exclude_dirs"]:
+            active.append("exclude dirs")
+        if filters["min_size"]:
+            active.append("min size")
+        if filters["max_size"]:
+            active.append("max size")
+        if filters["max_depth"] is not None:
+            active.append("max depth")
+        if active:
+            self.status_label.config(text=f"🧹 Filters active: {', '.join(active)}")
+
     def _on_option_change(self) -> None:
         """Handle option changes and save settings."""
         self._save_current_settings()
         if self.path_var.get():
             self._update_preview()
+        else:
+            self._status_for_filters()
+
+    def _parse_extensions(self, raw_value: str) -> List[str]:
+        return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+    def _parse_patterns(self, raw_value: str) -> List[str]:
+        return [part.strip() for part in raw_value.split(",") if part.strip()]
+
+    def _parse_size_limit(self, raw_value: str, multiplier: int) -> Optional[int]:
+        if not raw_value.strip():
+            return None
+        try:
+            value = float(raw_value)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return int(value * multiplier)
+
+    def _parse_depth(self) -> Optional[int]:
+        raw_value = self.max_depth_var.get().strip()
+        if not raw_value:
+            return None
+        try:
+            value = int(raw_value)
+        except ValueError:
+            return None
+        if value < 0:
+            return None
+        return value
+
+    def _get_filter_settings(self) -> Dict[str, object]:
+        include_exts = self._parse_extensions(self.include_extensions_var.get())
+        exclude_exts = self._parse_extensions(self.exclude_extensions_var.get())
+        exclude_patterns = self._parse_patterns(self.exclude_patterns_var.get())
+        exclude_dirs = self._parse_patterns(self.exclude_dirs_var.get())
+        min_size = self._parse_size_limit(self.min_size_kb_var.get(), 1024)
+        max_size = self._parse_size_limit(self.max_size_mb_var.get(), 1024 * 1024)
+        max_depth = self._parse_depth()
+        return {
+            "skip_symlinks": self.skip_symlinks_var.get(),
+            "include_extensions": include_exts or None,
+            "exclude_extensions": exclude_exts or None,
+            "exclude_patterns": exclude_patterns or None,
+            "exclude_dirs": exclude_dirs or None,
+            "min_size": min_size or 0,
+            "max_size": max_size,
+            "max_depth": max_depth,
+        }
+
+    def _validate_filters(self) -> bool:
+        if self._parse_size_limit(self.min_size_kb_var.get(), 1024) is None and self.min_size_kb_var.get().strip():
+            messagebox.showerror("Invalid Filter", "Min size must be a non-negative number.")
+            return False
+        if self._parse_size_limit(self.max_size_mb_var.get(), 1024 * 1024) is None and self.max_size_mb_var.get().strip():
+            messagebox.showerror("Invalid Filter", "Max size must be a non-negative number.")
+            return False
+        min_size = self._parse_size_limit(self.min_size_kb_var.get(), 1024)
+        max_size = self._parse_size_limit(self.max_size_mb_var.get(), 1024 * 1024)
+        if min_size is not None and max_size is not None and min_size > max_size:
+            messagebox.showerror("Invalid Filter", "Min size cannot be larger than max size.")
+            return False
+        if self.max_depth_var.get().strip() and self._parse_depth() is None:
+            messagebox.showerror("Invalid Filter", "Max depth must be a non-negative whole number.")
+            return False
+        return True
+
+    def _clear_filters(self) -> None:
+        self.include_extensions_var.set("")
+        self.exclude_extensions_var.set("")
+        self.exclude_patterns_var.set("")
+        self.exclude_dirs_var.set("")
+        self.min_size_kb_var.set("")
+        self.max_size_mb_var.set("")
+        self.max_depth_var.set("")
+        self._save_current_settings()
+        if self.path_var.get():
+            self._update_preview()
+
+    def _analyze_folder(self, path_obj: Path) -> Dict[str, int]:
+        """Analyze folder contents efficiently for preview stats."""
+        filters = self._get_filter_settings()
+        summary = analyze_subfolders(
+            path_obj,
+            include_hidden=self.include_hidden_var.get(),
+            **filters,
+        )
+        return {
+            "total_files": summary.total_files,
+            "total_bytes": summary.total_bytes,
+            "subfolders": summary.subfolders,
+            "duplicates": summary.duplicates,
+            "archives_found": summary.archives_found,
+            "skipped_hidden": summary.skipped_hidden,
+            "skipped_symlinks": summary.skipped_symlinks,
+            "skipped_extension": summary.skipped_extension,
+            "skipped_pattern": summary.skipped_pattern,
+            "skipped_size": summary.skipped_size,
+            "skipped_dirs": summary.skipped_dirs,
+        }
 
     def _update_preview(self) -> None:
         """Update the preview with current folder analysis."""
@@ -1404,41 +1248,29 @@ class FolderFlattenerPro:
             self._clear_preview()
             self._log(f"⚠️ Invalid folder path: {path_str}")
             return
+
+        if not self._validate_filters():
+            self._clear_preview()
+            return
         
         try:
             # Analyze folder in background to avoid UI freeze
             def analyze():
                 try:
-                    files = list_files_in_subfolders(
-                        path_obj, 
-                        include_hidden=self.include_hidden_var.get()
-                    )
-                    # Count .zip archives in subfolders
-                    try:
-                        zips = find_zip_archives(
-                            path_obj,
-                            include_hidden=self.include_hidden_var.get()
-                        )
-                        archives_found = len(zips)
-                    except Exception:
-                        archives_found = 0
-                    
-                    total_files = len(files)
-                    total_bytes = sum(f.size for f in files)
-                    
-                    # Count subfolders
-                    subfolders = set()
-                    for file_info in files:
-                        subfolders.add(file_info.source.parent)
-                    
-                    # Estimate potential duplicates
-                    names = [f.source.name for f in files]
-                    duplicates = len(names) - len(set(names))
-                    
+                    analysis = self._analyze_folder(path_obj)
                     # Update UI in main thread
                     self.root.after(0, lambda: self._update_preview_display(
-                        total_files, total_bytes, len(subfolders), duplicates,
-                        archives_found
+                        analysis["total_files"],
+                        analysis["total_bytes"],
+                        analysis["subfolders"],
+                        analysis["duplicates"],
+                        analysis["archives_found"],
+                        analysis["skipped_hidden"],
+                        analysis["skipped_symlinks"],
+                        analysis["skipped_extension"],
+                        analysis["skipped_pattern"],
+                        analysis["skipped_size"],
+                        analysis["skipped_dirs"],
                     ))
                     
                 except Exception as e:
@@ -1451,7 +1283,20 @@ class FolderFlattenerPro:
         except Exception as e:
             self._log(f"❌ Error starting folder analysis: {e}")
 
-    def _update_preview_display(self, files: int, bytes_total: int, folders: int, duplicates: int, archives_found: int = 0) -> None:
+    def _update_preview_display(
+        self,
+        files: int,
+        bytes_total: int,
+        folders: int,
+        duplicates: int,
+        archives_found: int = 0,
+        skipped_hidden: int = 0,
+        skipped_symlinks: int = 0,
+        skipped_extension: int = 0,
+        skipped_pattern: int = 0,
+        skipped_size: int = 0,
+        skipped_dirs: int = 0,
+    ) -> None:
         """Update the preview display with analysis results."""
         self.total_files = files
         self.total_bytes = bytes_total
@@ -1462,6 +1307,23 @@ class FolderFlattenerPro:
         self.folders_label.config(text=f"📁 Subfolders: {folders:,}")
         self.duplicates_label.config(text=f"🔄 Potential duplicates: {duplicates:,}")
         self.archives_label.config(text=f"🗜️ Archives found: {archives_found:,}")
+        self.extracted_label.config(text="📤 Extracted entries: --")
+        self.filtered_label.config(
+            text=(
+                "🧹 Filtered out: "
+                f"{(skipped_hidden + skipped_symlinks + skipped_extension + skipped_pattern + skipped_size + skipped_dirs):,}"
+            )
+        )
+        self.filtered_breakdown_label.config(
+            text=(
+                f"Hidden {skipped_hidden:,} • "
+                f"Links {skipped_symlinks:,} • "
+                f"Ext {skipped_extension:,} • "
+                f"Patterns {skipped_pattern:,} • "
+                f"Size {skipped_size:,} • "
+                f"Dirs {skipped_dirs:,}"
+            )
+        )
         
         # Update status
         if files > 0:
@@ -1484,6 +1346,10 @@ class FolderFlattenerPro:
         self.size_label.config(text="💾 Total size: --")
         self.folders_label.config(text="📁 Subfolders: --")
         self.duplicates_label.config(text="🔄 Potential duplicates: --")
+        self.archives_label.config(text="🗜️ Archives found: --")
+        self.extracted_label.config(text="📤 Extracted entries: --")
+        self.filtered_label.config(text="🧹 Filtered out: --")
+        self.filtered_breakdown_label.config(text="Hidden -- • Links -- • Ext -- • Patterns -- • Size -- • Dirs --")
         self.status_label.config(text="📂 Select a folder to analyze")
         self.start_btn.config(state="disabled")
 
@@ -1531,6 +1397,9 @@ class FolderFlattenerPro:
         # Reset UI for operation
         self._prepare_for_operation()
         
+        if not self._validate_filters():
+            return
+
         # Get settings
         duplicate_mode = self.duplicate_mode_var.get()
         remove_empty = self.remove_empty_var.get()
@@ -1539,6 +1408,25 @@ class FolderFlattenerPro:
         extract_archives = self.extract_archives_var.get()
         archive_originals = self.archive_originals_var.get()
         archive_folder = Path(self.archive_folder_var.get()).resolve() if self.archive_folder_var.get().strip() else None
+        filters = self._get_filter_settings()
+        access_warnings = check_directory_access(root, write_required=not dry_run)
+        if access_warnings:
+            messagebox.showerror(
+                "Folder Access Issue",
+                "\n".join(access_warnings),
+            )
+            return
+
+        if archive_originals and not extract_archives:
+            archive_originals = False
+            self._log("⚠️ Archive originals requires extraction enabled; disabling archive originals.")
+
+        if archive_originals and archive_folder and archive_folder == root:
+            messagebox.showerror(
+                "Invalid Archive Folder",
+                "Archive folder cannot be the same as the target root folder.",
+            )
+            return
         
         mode_text = "🔍 DRY RUN" if dry_run else "🚀 LIVE MODE"
         self._log(f"\n{'='*50}")
@@ -1549,6 +1437,21 @@ class FolderFlattenerPro:
         self._log(f"👁️ Include hidden files: {include_hidden}")
         self._log(f"🗜️ Extract archives: {extract_archives}")
         self._log(f"📦 Archive originals: {archive_originals}")
+        self._log(f"🔗 Skip symlinks: {filters['skip_symlinks']}")
+        if filters["include_extensions"]:
+            self._log(f"✅ Include extensions: {filters['include_extensions']}")
+        if filters["exclude_extensions"]:
+            self._log(f"🚫 Exclude extensions: {filters['exclude_extensions']}")
+        if filters["exclude_patterns"]:
+            self._log(f"🧹 Exclude patterns: {filters['exclude_patterns']}")
+        if filters["exclude_dirs"]:
+            self._log(f"📁 Exclude dirs: {filters['exclude_dirs']}")
+        if filters["min_size"]:
+            self._log(f"📏 Min size: {human_size(filters['min_size'])}")
+        if filters["max_size"]:
+            self._log(f"📐 Max size: {human_size(filters['max_size'])}")
+        if filters["max_depth"] is not None:
+            self._log(f"📎 Max depth: {filters['max_depth']}")
         if archive_originals and archive_folder:
             self._log(f"📂 Archive folder: {archive_folder}")
         self._log(f"{'='*50}\n")
@@ -1569,6 +1472,15 @@ class FolderFlattenerPro:
                     extract_archives=extract_archives,
                     archive_originals=archive_originals,
                     archive_folder=archive_folder,
+                    record_moves=True,
+                    skip_symlinks=filters["skip_symlinks"],
+                    include_extensions=filters["include_extensions"],
+                    exclude_extensions=filters["exclude_extensions"],
+                    exclude_patterns=filters["exclude_patterns"],
+                    exclude_dirs=filters["exclude_dirs"],
+                    min_size=filters["min_size"],
+                    max_size=filters["max_size"],
+                    max_depth=filters["max_depth"],
                 )
                 self.events.put({"phase": "complete", "stats": stats})
             except Exception as e:
@@ -1578,13 +1490,93 @@ class FolderFlattenerPro:
         self.worker = Worker()
         self.worker.start(operation_worker)
 
-    def _prepare_for_operation(self) -> None:
+    def _undo_last_operation(self) -> None:
+        """Undo the last operation when possible."""
+        if self.worker.is_running():
+            return
+
+        if not self.last_operation or not getattr(self.last_operation, "undo_supported", False):
+            messagebox.showinfo(
+                "Undo Unavailable",
+                "There is no undoable operation available.",
+            )
+            return
+
+        moves = list(getattr(self.last_operation, "moves", []))
+        if not moves:
+            messagebox.showinfo(
+                "Undo Unavailable",
+                "No move history was recorded for the last operation.",
+            )
+            return
+
+        confirm = messagebox.askyesno(
+            "Undo Last Operation",
+            "This will move files back to their original locations.\n\nProceed?",
+        )
+        if not confirm:
+            return
+
+        self._prepare_for_operation(
+            status_text="↩️ Undo in progress...",
+            progress_text="↩️ Starting undo...",
+        )
+
+        def undo_worker() -> None:
+            try:
+                total = len(moves)
+                for idx, record in enumerate(reversed(moves), start=1):
+                    if self.worker.cancel.is_set():
+                        break
+                    source = Path(record.source)
+                    destination = Path(record.destination)
+                    if not destination.exists():
+                        self.events.put({
+                            "phase": "undo_move",
+                            "current": idx,
+                            "total": total,
+                            "source": str(destination),
+                            "dest": str(source),
+                            "action": "missing",
+                        })
+                        continue
+                    target = source
+                    action = "restore"
+                    if target.exists():
+                        target = generate_unique_filename(target)
+                        action = "rename"
+                    try:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(destination), str(target))
+                        self.events.put({
+                            "phase": "undo_move",
+                            "current": idx,
+                            "total": total,
+                            "source": str(destination),
+                            "dest": str(target),
+                            "action": action,
+                        })
+                    except (OSError, shutil.Error) as e:
+                        self.events.put({"phase": "error", "error": str(e)})
+                        return
+                self.events.put({
+                    "phase": "undo_complete",
+                    "cancelled": self.worker.cancel.is_set(),
+                })
+            except Exception as e:
+                self.events.put({"phase": "error", "error": str(e)})
+
+        self.worker = Worker()
+        self.worker.start(undo_worker)
+
+    def _prepare_for_operation(self, status_text: str = "🔄 Operation in progress...", progress_text: str = "🚀 Starting operation...") -> None:
         """Prepare UI for operation start."""
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
+        self.undo_btn.config(state="disabled")
         self.progress_bar.set_progress(0, 100)
-        self.progress_label.config(text="🚀 Starting operation...")
-        self.status_label.config(text="🔄 Operation in progress...")
+        self.progress_label.config(text=progress_text)
+        self.status_label.config(text=status_text)
         
         # Clear log for new operation
         self.log_text.delete("1.0", tk.END)
@@ -1621,12 +1613,34 @@ class FolderFlattenerPro:
     def _handle_event(self, event: dict) -> None:
         """Handle events from the worker thread."""
         phase = event.get("phase")
-        
+
         if phase == "scan":
             total = event.get("total", 0)
             message = event.get("message", "Scanning...")
             self._log(f"🔍 {message}")
             self.progress_bar.set_progress(0, max(total, 1))
+            skipped_hidden = event.get("skipped_hidden", 0)
+            skipped_symlinks = event.get("skipped_symlinks", 0)
+            skipped_extension = event.get("skipped_extension", 0)
+            skipped_pattern = event.get("skipped_pattern", 0)
+            skipped_size = event.get("skipped_size", 0)
+            skipped_dirs = event.get("skipped_dirs", 0)
+            filtered_out = (
+                skipped_hidden
+                + skipped_symlinks
+                + skipped_extension
+                + skipped_pattern
+                + skipped_size
+                + skipped_dirs
+            )
+            if filtered_out:
+                self._log(
+                    "🧹 Filtered out "
+                    f"{filtered_out:,} files "
+                    f"(hidden {skipped_hidden:,}, links {skipped_symlinks:,}, "
+                    f"ext {skipped_extension:,}, patterns {skipped_pattern:,}, "
+                    f"size {skipped_size:,}, dirs {skipped_dirs:,})"
+                )
             
         elif phase == "extract_scan":
             total = event.get("total", 0)
@@ -1660,10 +1674,26 @@ class FolderFlattenerPro:
             emoji = action_emoji.get(action, "📦")
             file_name = Path(file_path).name if file_path else "Unknown file"
             self._log(f"{emoji} [{current:,}/{total:,}] {action}: {file_name}")
-            
+
+        elif phase == "undo_move":
+            current = event.get("current", 0)
+            total = event.get("total", 1)
+            source = event.get("source", "")
+            dest = event.get("dest", "")
+            action = event.get("action", "restore")
+            self.progress_bar.set_progress(current, total)
+            self.progress_label.config(
+                text=f"↩️ Undo: {current:,}/{total:,} ({(current / max(total, 1)) * 100:.1f}%)"
+            )
+            self._log(f"↩️ {action}: {Path(source).name} → {Path(dest).name}")
+
         elif phase == "complete":
             stats = event.get("stats")
             self._handle_operation_complete(stats)
+
+        elif phase == "undo_complete":
+            cancelled = event.get("cancelled", False)
+            self._handle_undo_complete(cancelled)
             
         elif phase == "error":
             error_msg = event.get("error", "Unknown error occurred")
@@ -1680,6 +1710,20 @@ class FolderFlattenerPro:
             bytes_moved = getattr(stats, 'bytes_moved', 0)
             empty_removed = getattr(stats, 'empty_folders_removed', 0)
             cancelled = getattr(stats, 'cancelled', False)
+            skipped_hidden = getattr(stats, 'skipped_hidden', 0)
+            skipped_symlinks = getattr(stats, 'skipped_symlinks', 0)
+            skipped_extension = getattr(stats, 'skipped_extension', 0)
+            skipped_pattern = getattr(stats, 'skipped_pattern', 0)
+            skipped_size = getattr(stats, 'skipped_size', 0)
+            skipped_dirs = getattr(stats, 'skipped_dirs', 0)
+            filtered_out = (
+                skipped_hidden
+                + skipped_symlinks
+                + skipped_extension
+                + skipped_pattern
+                + skipped_size
+                + skipped_dirs
+            )
             
             self._log(f"\n{'='*50}")
             if cancelled:
@@ -1691,11 +1735,21 @@ class FolderFlattenerPro:
             self._log(f"⏭️ Files skipped: {skipped:,}")
             self._log(f"❌ Errors: {errors:,}")
             self._log(f"💾 Data moved: {human_size(bytes_moved)}")
+            if filtered_out:
+                self._log(
+                    "🧹 Filtered out "
+                    f"{filtered_out:,} files "
+                    f"(hidden {skipped_hidden:,}, links {skipped_symlinks:,}, "
+                    f"ext {skipped_extension:,}, patterns {skipped_pattern:,}, "
+                    f"size {skipped_size:,}, dirs {skipped_dirs:,})"
+                )
             # Archive stats
             af = getattr(stats, 'archives_found', 0)
             ae = getattr(stats, 'archives_extracted', 0)
             ab = getattr(stats, 'archive_bytes_written', 0)
             am = getattr(stats, 'archives_moved', 0)
+            self.archives_label.config(text=f"🗜️ Archives found: {af:,}")
+            self.extracted_label.config(text=f"📤 Extracted entries: {ae:,}")
             if af or ae or am:
                 self._log(f"🗜️ Archives found: {af:,}")
                 self._log(f"📤 Extracted entries: {ae:,} ({human_size(ab)})")
@@ -1718,12 +1772,133 @@ class FolderFlattenerPro:
                         f"Processed {moved:,} files with {errors:,} errors.\n"
                         f"Check the log for details."
                     )
+            self._update_undo_state(stats)
+            self.last_stats = stats
+
+    def _update_undo_state(self, stats: Optional[FlattenStats]) -> None:
+        """Enable or disable undo based on operation stats."""
+        if (
+            stats
+            and getattr(stats, "undo_supported", False)
+            and getattr(stats, "moves", None)
+        ):
+            self.last_operation = stats
+            self.last_stats = stats
+            self.undo_btn.config(state="normal")
+            self._log("↩️ Undo available for the last operation.")
+        else:
+            self.last_operation = None
+            if stats:
+                self.last_stats = stats
+            self.undo_btn.config(state="disabled")
+            if stats and not getattr(stats, "undo_supported", True):
+                self._log("ℹ️ Undo unavailable (overwrites, extraction, dry run, or cancellation).")
+
+    def _handle_undo_complete(self, cancelled: bool) -> None:
+        """Handle completion of undo operations."""
+        self._operation_complete()
+        if cancelled:
+            self._log("⏹️ Undo cancelled.")
+            messagebox.showwarning(
+                "Undo Cancelled",
+                "Undo was cancelled before completion.",
+            )
+        else:
+            self._log("✅ Undo completed successfully.")
+            messagebox.showinfo(
+                "Undo Completed",
+                "Last operation has been undone.",
+            )
+        self.last_operation = None
+        self.undo_btn.config(state="disabled")
+        if self.path_var.get():
+            self.root.after(500, self._update_preview)
 
     def _handle_operation_error(self, error_msg: str) -> None:
         """Handle operation error."""
         self._operation_complete()
         self._log(f"💥 FATAL ERROR: {error_msg}")
         messagebox.showerror("Operation Failed", f"Operation failed with error:\n\n{error_msg}")
+        self.last_operation = None
+        self.last_stats = None
+        self.undo_btn.config(state="disabled")
+
+    def _build_summary_text(self) -> str:
+        lines = [
+            f"Folder: {self.path_var.get()}",
+            f"Files to move: {self.total_files:,}",
+            f"Total size: {human_size(self.total_bytes)}",
+            f"Duplicate handling: {self.duplicate_mode_var.get()}",
+        ]
+        filters = self._get_filter_settings()
+        if filters["include_extensions"]:
+            lines.append(f"Include extensions: {filters['include_extensions']}")
+        if filters["exclude_extensions"]:
+            lines.append(f"Exclude extensions: {filters['exclude_extensions']}")
+        if filters["exclude_patterns"]:
+            lines.append(f"Exclude patterns: {filters['exclude_patterns']}")
+        if filters["exclude_dirs"]:
+            lines.append(f"Exclude dirs: {filters['exclude_dirs']}")
+        if filters["min_size"]:
+            lines.append(f"Min size: {human_size(filters['min_size'])}")
+        if filters["max_size"]:
+            lines.append(f"Max size: {human_size(filters['max_size'])}")
+        if filters["max_depth"] is not None:
+            lines.append(f"Max depth: {filters['max_depth']}")
+        if self.last_stats:
+            lines.append(f"Last moved: {getattr(self.last_stats, 'moved', 0):,}")
+            lines.append(f"Last skipped: {getattr(self.last_stats, 'skipped', 0):,}")
+            lines.append(f"Last errors: {getattr(self.last_stats, 'errors', 0):,}")
+        return "\n".join(lines)
+
+    def _copy_summary(self) -> None:
+        summary = self._build_summary_text()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(summary)
+        self._log("📋 Summary copied to clipboard.")
+
+    def _export_report(self) -> None:
+        if not self.path_var.get():
+            messagebox.showinfo("Export Report", "Select a folder first.")
+            return
+        report = {
+            "folder": self.path_var.get(),
+            "preview": {
+                "files": self.total_files,
+                "bytes": self.total_bytes,
+                "duplicate_mode": self.duplicate_mode_var.get(),
+            },
+        }
+        report["filters"] = self._get_filter_settings()
+        if self.last_stats:
+            report["last_run"] = {
+                "moved": getattr(self.last_stats, "moved", 0),
+                "skipped": getattr(self.last_stats, "skipped", 0),
+                "errors": getattr(self.last_stats, "errors", 0),
+                "bytes_moved": getattr(self.last_stats, "bytes_moved", 0),
+                "archives_found": getattr(self.last_stats, "archives_found", 0),
+                "archives_extracted": getattr(self.last_stats, "archives_extracted", 0),
+                "archives_moved": getattr(self.last_stats, "archives_moved", 0),
+                "filtered_out": getattr(self.last_stats, "skipped_hidden", 0)
+                + getattr(self.last_stats, "skipped_symlinks", 0)
+                + getattr(self.last_stats, "skipped_extension", 0)
+                + getattr(self.last_stats, "skipped_pattern", 0)
+                + getattr(self.last_stats, "skipped_size", 0)
+                + getattr(self.last_stats, "skipped_dirs", 0),
+            }
+        filepath = filedialog.asksaveasfilename(
+            title="Export report",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json")],
+        )
+        if not filepath:
+            return
+        try:
+            with open(filepath, "w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2)
+            self._log(f"💾 Report saved to {filepath}")
+        except OSError as exc:
+            messagebox.showerror("Export Failed", f"Could not save report:\n{exc}")
 
     def _show_help(self) -> None:
         """Show help dialog with usage instructions."""
@@ -1735,6 +1910,10 @@ WHAT IT DOES:
 • Handles duplicate files according to your preference
 • Optionally removes empty folders after moving
 • Provides detailed preview and progress tracking
+• Supports one-click undo for safe operations
+• Optional .zip archive extraction from subfolders
+• Optional filters to include/exclude extensions, patterns, or sizes
+• Optional directory filters and max-depth constraints
 
 HOW TO USE:
 1. Select a folder using Browse or drag & drop
@@ -1747,20 +1926,28 @@ HOW TO USE:
    • Remove empty folders: Clean up after moving
    • Include hidden files: Process dotfiles too
    • Dry run: Preview without making changes
+   • Extract archives: Pull files out of .zip archives
+   • Archive originals: Move zip files into a safe archive folder
+   • Filters: include/exclude extensions or patterns, set size limits
+   • Directory filters: exclude directories or limit depth
 5. Click "Start Flattening" to begin
 
 KEYBOARD SHORTCUTS:
 • Ctrl+O: Browse for folder
 • Ctrl+Enter: Start operation
 • Esc: Cancel operation
+• Ctrl+Z: Undo last operation (when available)
 • F1: Show this help
 • Ctrl+, : Show settings
+• Use “Copy Summary” or “Export Report” for audits
 
 SAFETY FEATURES:
 • Dry run mode for safe preview
 • Detailed confirmation before live operations
 • Comprehensive logging of all actions
 • Automatic settings persistence
+• Undo available when no overwrites or extractions occur
+• Optional symlink skipping to avoid surprises
 
 TIPS:
 • Always use Dry Run first to preview changes
@@ -1849,6 +2036,14 @@ TIPS:
             command=self._on_option_change,
         ).pack(anchor="w", pady=4)
 
+        ttk.Checkbutton(
+            opt_frame,
+            text="🔗 Skip symbolic links",
+            variable=self.skip_symlinks_var,
+            style="Modern.TCheckbutton",
+            command=self._on_option_change,
+        ).pack(anchor="w", pady=4)
+
         af_frame = ttk.Frame(container, style="Card.TFrame")
         af_frame.pack(fill="x", pady=(10, 0))
         ttk.Label(af_frame, text="Archive folder (optional):", style="Info.TLabel").pack(anchor="w")
@@ -1857,6 +2052,44 @@ TIPS:
         af_entry = ttk.Entry(af_inner, textvariable=self.archive_folder_var, style="Modern.TEntry")
         af_entry.pack(side="left", fill="x", expand=True, pady=(0, 5))
         ttk.Button(af_inner, text="📂 Browse", style="Primary.TButton", command=self._browse_archive_folder).pack(side="left", padx=(8, 0))
+
+        ttk.Separator(container, style="Modern.TSeparator").pack(fill="x", pady=10)
+        filter_section = ttk.Label(container, text="🧹 Filters", style="Info.TLabel")
+        filter_section.pack(anchor="w")
+
+        filter_frame = ttk.Frame(container, style="Card.TFrame")
+        filter_frame.pack(fill="x", pady=(8, 0))
+        ttk.Label(filter_frame, text="Include extensions:", style="Muted.TLabel").pack(anchor="w")
+        include_entry = ttk.Entry(filter_frame, textvariable=self.include_extensions_var, style="Modern.TEntry")
+        include_entry.pack(fill="x", pady=(0, 6))
+        include_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(filter_frame, text="Exclude extensions:", style="Muted.TLabel").pack(anchor="w")
+        exclude_entry = ttk.Entry(filter_frame, textvariable=self.exclude_extensions_var, style="Modern.TEntry")
+        exclude_entry.pack(fill="x", pady=(0, 6))
+        exclude_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(filter_frame, text="Exclude patterns:", style="Muted.TLabel").pack(anchor="w")
+        pattern_entry = ttk.Entry(filter_frame, textvariable=self.exclude_patterns_var, style="Modern.TEntry")
+        pattern_entry.pack(fill="x", pady=(0, 6))
+        pattern_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(filter_frame, text="Exclude directories:", style="Muted.TLabel").pack(anchor="w")
+        dir_entry = ttk.Entry(filter_frame, textvariable=self.exclude_dirs_var, style="Modern.TEntry")
+        dir_entry.pack(fill="x", pady=(0, 6))
+        dir_entry.bind("<KeyRelease>", self._on_option_change)
+
+        size_filters = ttk.Frame(filter_frame, style="Card.TFrame")
+        size_filters.pack(fill="x")
+        ttk.Label(size_filters, text="Min size (KB):", style="Muted.TLabel").pack(side="left")
+        min_entry = ttk.Entry(size_filters, textvariable=self.min_size_kb_var, style="Modern.TEntry", width=10)
+        min_entry.pack(side="left", padx=(6, 16))
+        min_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(size_filters, text="Max size (MB):", style="Muted.TLabel").pack(side="left")
+        max_entry = ttk.Entry(size_filters, textvariable=self.max_size_mb_var, style="Modern.TEntry", width=10)
+        max_entry.pack(side="left")
+        max_entry.bind("<KeyRelease>", self._on_option_change)
+        ttk.Label(size_filters, text="Max depth:", style="Muted.TLabel").pack(side="left", padx=(12, 0))
+        depth_entry = ttk.Entry(size_filters, textvariable=self.max_depth_var, style="Modern.TEntry", width=6)
+        depth_entry.pack(side="left")
+        depth_entry.bind("<KeyRelease>", self._on_option_change)
 
         # Duplicate mode
         ttk.Separator(container, style="Modern.TSeparator").pack(fill="x", pady=10)
@@ -1889,6 +2122,14 @@ TIPS:
             self.extract_archives_var.set(defaults.get('extract_archives', True))
             self.archive_originals_var.set(defaults.get('archive_originals', False))
             self.archive_folder_var.set(defaults.get('archive_folder', ''))
+            self.skip_symlinks_var.set(defaults.get('skip_symlinks', True))
+            self.include_extensions_var.set(defaults.get('include_extensions', ''))
+            self.exclude_extensions_var.set(defaults.get('exclude_extensions', ''))
+            self.exclude_patterns_var.set(defaults.get('exclude_patterns', ''))
+            self.exclude_dirs_var.set(defaults.get('exclude_dirs', ''))
+            self.min_size_kb_var.set(defaults.get('min_size_kb', ''))
+            self.max_size_mb_var.set(defaults.get('max_size_mb', ''))
+            self.max_depth_var.set(defaults.get('max_depth', ''))
             self._save_current_settings()
             if self.path_var.get():
                 self._update_preview()
@@ -1906,6 +2147,14 @@ TIPS:
         self.settings.set('extract_archives', self.extract_archives_var.get())
         self.settings.set('archive_originals', self.archive_originals_var.get())
         self.settings.set('archive_folder', self.archive_folder_var.get())
+        self.settings.set('skip_symlinks', self.skip_symlinks_var.get())
+        self.settings.set('include_extensions', self.include_extensions_var.get())
+        self.settings.set('exclude_extensions', self.exclude_extensions_var.get())
+        self.settings.set('exclude_patterns', self.exclude_patterns_var.get())
+        self.settings.set('exclude_dirs', self.exclude_dirs_var.get())
+        self.settings.set('min_size_kb', self.min_size_kb_var.get())
+        self.settings.set('max_size_mb', self.max_size_mb_var.get())
+        self.settings.set('max_depth', self.max_depth_var.get())
         self.settings.set('window_geometry', self.root.geometry())
         self.settings.save_settings()
 

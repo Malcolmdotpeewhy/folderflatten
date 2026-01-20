@@ -21,7 +21,10 @@
 - **Duplicate Intelligence**: Smart recommendations based on file patterns
 - **Progress Tracking**: Detailed operation progress with file-by-file updates
 - **Error Handling**: Graceful error recovery with detailed logging
-- **Undo Awareness**: Operation tracking for future undo functionality
+- **Undo Support**: One-click undo for safe operations (when no overwrites/extractions occur)
+- **Filters**: Include/exclude extensions, patterns, and file sizes
+- **Directory Controls**: Exclude directories or limit depth
+- **Reports**: Copy or export summaries for audit trails
 
 ## 🎯 Key Features
 
@@ -69,6 +72,12 @@
 - **Remove Empty Folders**: Automatically clean up empty directories
 - **Include Hidden Files**: Process dotfiles and system files
 - **Dry Run Mode**: Preview without making any changes
+- **Extract Archives**: Pull files out of `.zip` archives in subfolders
+- **Archive Originals**: Move original `.zip` files into an archive folder
+- **Skip Symlinks**: Avoid moving symbolic links
+- **Filters**: Include/exclude extensions, patterns, and size thresholds
+- **Directory Filters**: Exclude directories and limit scan depth
+- **Reports**: Copy summary or export JSON reports
 
 ### 4. Operation Monitoring
 - **Live Progress**: Real-time progress bar with smooth animations
@@ -82,6 +91,7 @@
 |----------|--------|
 | `Ctrl + O` | Browse for folder |
 | `Ctrl + Enter` | Start operation |
+| `Ctrl + Z` | Undo last operation (when available) |
 | `Escape` | Cancel operation |
 | `F1` | Show help |
 | `Ctrl + ,` | Open settings |
