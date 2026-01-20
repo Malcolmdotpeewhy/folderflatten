@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""
+Test script for Folder Flattener functionality
+Creates a test folder structure and tests the flattening logic
+"""
+
+import os
+import shutil
+import tempfile
+from pathlib import Path
+import sys
+
+# Add the script directory to path to import our module
+script_dir = Path(__file__).parent
+sys.path.insert(0, str(script_dir))
+
+def create_test_structure(base_path: Path) -> None:
+    """Create a test folder structure for testing"""
+    # Create folder structure
+    folders = [
+        "subfolder1",
+        "subfolder2",
+        "subfolder1/deep1",
+        "subfolder1/deep2",
+        "subfolder2/deep3",
+        "empty_folder"
+    ]
+    
+    for folder in folders:
+        (base_path / folder).mkdir(parents=True, exist_ok=True)
+    
+    # Create test files
+    test_files = [
+        "root_file.txt",
+        "subfolder1/file1.txt",
+        "subfolder1/file2.txt",
+        "subfolder1/deep1/deep_file1.txt",
+        "subfolder1/deep2/deep_file2.txt",
+        "subfolder2/file3.txt",
+        "subfolder2/deep3/deep_file3.txt",
+        "subfolder2/duplicate.txt"  # This will test duplicate handling
+    ]
+    
+    for file_path in test_files:
+        full_path = base_path / file_path
+        full_path.write_text(f"Content of {file_path}\nCreated for testing folder flattener.")
+    
+    # Create a duplicate file in root for testing
+    (base_path / "duplicate.txt").write_text("Original duplicate file in root")
+
+def test_flattening_logic():
+    """Test the core flattening functionality"""
+    print("=" * 50)
+    print("Testing Folder Flattener Logic")
+    print("=" * 50)
+    
+    # Create temporary test directory
+    with tempfile.TemporaryDirectory() as temp_dir:
+        test_path = Path(temp_dir) / "test_folder"  
+        test_path.mkdir()
+        
+        print(f"Created test folder: {test_path}")
+        
+        # Create test structure
+        create_test_structure(test_path)
+        
+        print("\nOriginal structure:")
+        print_folder_structure(test_path)
+        
+        # Count files before
+        original_files = list(test_path.rglob("*"))
+        original_file_count = len([f for f in original_files if f.is_file()])
+        original_folder_count = len([f for f in original_files if f.is_dir()]) - 1  # Exclude root
+        
+        print(f"\nBefore flattening:")
+        print(f"  Total files: {original_file_count}")
+        print(f"  Total subfolders: {original_folder_count}")
+        
+        # Test the flattening logic
+        from folder_flattener_gui import FolderFlattenerGUI
+        import tkinter as tk
+        
+        # Create a minimal GUI instance for testing
+        root = tk.Tk()
+        root.withdraw()  # Hide the window
+        
+        # Create app instance
+        app = FolderFlattenerGUI(root)
+        app.duplicate_handling.set("rename")
+        app.remove_empty_folders.set(True)
+        
+        # Get files to move
+        files_to_move = app.get_all_files_in_subfolders(test_path)
+        print(f"\nFiles found in subfolders: {len(files_to_move)}")
+        
+        # Simulate the flattening process
+        for source_path, rel_path in files_to_move:
+            target_path = test_path / source_path.name
+            
+            # Handle duplicates
+            if target_path.exists():
+                target_path = app.generate_unique_filename(target_path)
+                print(f"  Duplicate handled: {source_path.name} -> {target_path.name}")
+            
+            # Move file
+            shutil.move(str(source_path), str(target_path))
+            print(f"  Moved: {rel_path} -> {target_path.name}")
+        
+        # Remove empty folders
+        app.remove_empty_folders_recursive(test_path)
+        
+        print("\nAfter flattening:")
+        print_folder_structure(test_path)
+        
+        # Count files after
+        final_files = list(test_path.rglob("*"))
+        final_file_count = len([f for f in final_files if f.is_file()])
+        final_folder_count = len([f for f in final_files if f.is_dir()]) - 1  # Exclude root
+        
+        print(f"\nAfter flattening:")
+        print(f"  Total files: {final_file_count}")
+        print(f"  Total subfolders: {final_folder_count}")
+        
+        # Verify results
+        if final_folder_count == 0:
+            print("✅ All empty folders removed successfully")
+        else:
+            print("❌ Some folders remain")
+        
+        if final_file_count == original_file_count:
+            print("✅ All files preserved during flattening")
+        else:
+            print(f"❌ File count mismatch: {original_file_count} -> {final_file_count}")
+        
+        # Check for specific files
+        expected_files = [
+            "root_file.txt",
+            "file1.txt", 
+            "file2.txt",
+            "file3.txt",
+            "deep_file1.txt",
+            "deep_file2.txt", 
+            "deep_file3.txt",
+            "duplicate.txt",
+            "duplicate_1.txt"  # Renamed duplicate
+        ]
+        
+        missing_files = []
+        for expected in expected_files:
+            if not (test_path / expected).exists():
+                missing_files.append(expected)
+        
+        if not missing_files:
+            print("✅ All expected files found in root directory")
+        else:
+            print(f"❌ Missing files: {missing_files}")
+        
+        root.destroy()
+        
+        print("\n" + "=" * 50)
+        print("Test completed successfully!")
+        print("=" * 50)
+
+def print_folder_structure(path: Path, indent: str = "") -> None:
+    """Print the folder structure for visualization"""
+    items = sorted(path.iterdir(), key=lambda x: (x.is_file(), x.name))
+    
+    for item in items:
+        if item.is_dir():
+            print(f"{indent}📁 {item.name}/")
+            print_folder_structure(item, indent + "  ")
+        else:
+            print(f"{indent}📄 {item.name}")
+
+if __name__ == "__main__":
+    test_flattening_logic()

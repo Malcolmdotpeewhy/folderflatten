@@ -1,0 +1,24 @@
+# Folder Flattener Pro - Enhanced Requirements
+# Modern GUI application with glassmorphic design for intelligent folder organization
+
+# Core dependencies (standard library used primarily)
+# The application works with Python standard library only for basic functionality
+
+# Optional enhanced features:
+tkinterdnd2>=0.3.0    # Drag and drop functionality
+                      # Enables dragging folders directly into the application
+                      # Install with: pip install tkinterdnd2
+
+# Development and testing (optional):
+pytest>=7.0.0         # For running comprehensive tests
+black>=22.0.0         # Automatic code formatting  
+mypy>=0.950          # Static type checking
+
+# Performance optimization (optional):
+psutil>=5.9.0         # System monitoring and resource usage
+                      # For better progress tracking on large operations
+
+# Note: Folder Flattener Pro is designed to work without any external dependencies
+# All optional packages enhance the user experience but are not required
+# for core functionality. The app gracefully degrades features when packages
+# are not available.
