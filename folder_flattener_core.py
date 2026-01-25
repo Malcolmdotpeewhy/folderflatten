@@ -43,8 +43,6 @@ __all__ = [
     "FileInfo",
     "find_zip_archives",
 ]
-    "find_zip_archives",
-]
 
 # ----------------------------------------------------------------------------
 # Logging
@@ -248,6 +246,7 @@ def scan_files_in_subfolders(
     max_size: Optional[int] = None,
     collect_files: bool = True,
     max_depth: Optional[int] = None,
+    always_collect_extensions: Optional[List[str]] = None,
 ) -> tuple[List[FileInfo], ScanSummary]:
     """Scan and return files under root's subfolders with filter summary."""
     files: List[FileInfo] = []
@@ -256,6 +255,7 @@ def scan_files_in_subfolders(
 
     include_exts = _normalize_extensions(include_extensions)
     exclude_exts = _normalize_extensions(exclude_extensions)
+    always_collect_exts = _normalize_extensions(always_collect_extensions)
     name_counts: Dict[str, int] = {}
 
     for dirpath, dirnames, filenames in os.walk(root):
@@ -294,29 +294,40 @@ def scan_files_in_subfolders(
                 summary.skipped_symlinks += 1
                 continue
 
-            if _match_patterns(file_path, exclude_patterns):
-                summary.skipped_pattern += 1
-                continue
-
             suffix = file_path.suffix.lower()
-            if include_exts is not None and suffix not in include_exts:
-                summary.skipped_extension += 1
-                continue
-            if exclude_exts is not None and suffix in exclude_exts:
-                summary.skipped_extension += 1
-                continue
+            force_collect = (
+                always_collect_exts is not None
+                and suffix in always_collect_exts
+            )
 
-            try:
-                size = file_path.stat().st_size
-            except OSError:
-                size = 0
+            if not force_collect:
+                if _match_patterns(file_path, exclude_patterns):
+                    summary.skipped_pattern += 1
+                    continue
 
-            if min_size and size < min_size:
-                summary.skipped_size += 1
-                continue
-            if max_size is not None and size > max_size:
-                summary.skipped_size += 1
-                continue
+                if include_exts is not None and suffix not in include_exts:
+                    summary.skipped_extension += 1
+                    continue
+                if exclude_exts is not None and suffix in exclude_exts:
+                    summary.skipped_extension += 1
+                    continue
+
+                try:
+                    size = file_path.stat().st_size
+                except OSError:
+                    size = 0
+
+                if min_size and size < min_size:
+                    summary.skipped_size += 1
+                    continue
+                if max_size is not None and size > max_size:
+                    summary.skipped_size += 1
+                    continue
+            else:
+                try:
+                    size = file_path.stat().st_size
+                except OSError:
+                    size = 0
 
             summary.total_files += 1
             summary.total_bytes += size
@@ -536,16 +547,47 @@ def flatten_folder(
     overwrites = 0
     move_records: List[MoveRecord] = []
 
+    # 1. Scan everything in one pass
+    scan_always_collect = []
     if extract_archives:
-        zips = find_zip_archives(root, include_hidden=include_hidden)
-        archives_found = len(zips)
-        if progress_cb:
+        scan_always_collect.append(".zip")
+
+    files, scan_summary = scan_files_in_subfolders(
+        root,
+        include_hidden=include_hidden,
+        skip_symlinks=skip_symlinks,
+        include_extensions=include_extensions,
+        exclude_extensions=exclude_extensions,
+        exclude_patterns=exclude_patterns,
+        exclude_dirs=exclude_dirs,
+        min_size=min_size,
+        max_size=max_size,
+        max_depth=max_depth,
+        always_collect_extensions=scan_always_collect if scan_always_collect else None
+    )
+
+    # 2. Separate zips if needed
+    zips_to_process: List[Path] = []
+    files_to_move: List[FileInfo] = []
+
+    if extract_archives:
+        for f in files:
+            if f.source.suffix.lower() == ".zip":
+                zips_to_process.append(f.source)
+            else:
+                files_to_move.append(f)
+        archives_found = len(zips_to_process)
+        if progress_cb and archives_found > 0:
             progress_cb({
                 "phase": "extract_scan",
                 "total": archives_found,
                 "message": f"Found {archives_found} zip archive(s) to extract",
             })
+    else:
+        files_to_move = files
 
+    # 3. Process archives
+    if extract_archives and zips_to_process:
         # Determine archive destination for originals
         if archive_originals:
             if archive_folder is None:
@@ -564,7 +606,7 @@ def flatten_folder(
                     # originals
                     archive_originals = False
 
-        for idx_zip, zip_path in enumerate(zips, start=1):
+        for idx_zip, zip_path in enumerate(zips_to_process, start=1):
             if cancel_event is not None and cancel_event.is_set():
                 break
 
@@ -713,22 +755,8 @@ def flatten_folder(
                     })
                 continue
 
-    # Now list files to move from subfolders (optionally exclude .zip files)
-    files, scan_summary = scan_files_in_subfolders(
-        root,
-        include_hidden=include_hidden,
-        skip_symlinks=skip_symlinks,
-        include_extensions=include_extensions,
-        exclude_extensions=exclude_extensions,
-        exclude_patterns=exclude_patterns,
-        exclude_dirs=exclude_dirs,
-        min_size=min_size,
-        max_size=max_size,
-        max_depth=max_depth,
-    )
-    if extract_archives:
-        files = [f for f in files if f.source.suffix.lower() != ".zip"]
-
+    # 4. Move remaining files
+    files = files_to_move
     total_files = len(files)
     total_bytes = sum(f.size for f in files)
 
