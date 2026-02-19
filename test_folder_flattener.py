@@ -68,7 +68,7 @@ def test_flattening_logic():
         # Count files before
         original_files = list(test_path.rglob("*"))
         original_file_count = len([f for f in original_files if f.is_file()])
-        original_folder_count = len([f for f in original_files if f.is_dir()]) - 1  # Exclude root
+        original_folder_count = len([f for f in original_files if f.is_dir()])
         
         print(f"\nBefore flattening:")
         print(f"  Total files: {original_file_count}")
@@ -94,7 +94,7 @@ def test_flattening_logic():
         # Count files after
         final_files = list(test_path.rglob("*"))
         final_file_count = len([f for f in final_files if f.is_file()])
-        final_folder_count = len([f for f in final_files if f.is_dir()]) - 1  # Exclude root
+        final_folder_count = len([f for f in final_files if f.is_dir()])
         
         print(f"\nAfter flattening:")
         print(f"  Total files: {final_file_count}")

@@ -454,15 +454,17 @@ def generate_unique_filename(target_path: Path) -> Path:
 def remove_empty_folders_recursive(root: Path) -> int:
     """Remove empty subfolders under root. Returns number removed."""
     count = 0
+    root_str = os.fspath(root)
     # Walk bottom-up to safely remove nested dirs
-    for dirpath, _, _ in os.walk(root, topdown=False):
-        p = Path(dirpath)
-        if p == root:
+    for dirpath, _, _ in os.walk(root_str, topdown=False):
+        if dirpath == root_str:
             continue
         try:
-            if not any(Path(dirpath).iterdir()):
-                p.rmdir()
-                count += 1
+            # Efficiently check if directory is empty using scandir
+            with os.scandir(dirpath) as it:
+                if next(it, None) is None:
+                    os.rmdir(dirpath)
+                    count += 1
         except (OSError, PermissionError):
             # Not empty or not permitted
             continue
